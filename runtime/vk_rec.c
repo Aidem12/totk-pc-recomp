@@ -64,6 +64,47 @@ enum {
 
 static uint64_t now_ns(void) { return plat_now_ns(); }
 
+// All aggregates belong to the producer, serialized by vk_sync.c's sub_lock.
+// The recorder writes only r_submit_time; rec_submit reads it after rec_drain's
+// acquire of tail, published by rec_main after submit_run returns.
+typedef struct { uint64_t calls, ns, max_ns, bins[4]; } RecTiming;
+enum { TM_DRAIN, TM_SPACE, TM_SUBMIT_DIRECT, TM_SUBMIT_REC, TM_LOCK_DIRECT, TM_DRIVER_DIRECT,
+       TM_LOCK_REC, TM_DRIVER_REC, TM_REC_QUEUE, TM_COUNT };
+static RecTiming timing[TM_COUNT];
+typedef struct { uint64_t lock_ns, driver_ns, queue_ns; int measured; } SubmitTime;
+static SubmitTime r_submit_time;
+
+static int timing_on(void) { return (rt_trace & RT_TRACE_PERF) != 0; }
+
+static void timing_add(int kind, uint64_t ns) {
+    RecTiming *t = &timing[kind];
+    t->calls++, t->ns += ns;
+    if (ns > t->max_ns) t->max_ns = ns;
+    t->bins[ns < 10000 ? 0 : ns < 100000 ? 1 : ns < 1000000 ? 2 : 3]++;
+}
+
+// Measure only the existing queue lock and driver call. No aggregate is shared
+// between threads; the caller owns out (or hands it back through the ring).
+static VkResult timed_submit(const VkSubmitInfo2 *si, SubmitTime *out) {
+    out->measured = timing_on();
+    uint64_t t0 = out->measured ? now_ns() : 0;
+    vk_queue_lock();
+    uint64_t t1 = out->measured ? now_ns() : 0;
+    VkResult r = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, si, VK_NULL_HANDLE);
+    uint64_t t2 = out->measured ? now_ns() : 0;
+    vk_queue_unlock();
+    if (out->measured) out->lock_ns = t1 - t0, out->driver_ns = t2 - t1;
+    return r;
+}
+
+static void timing_submit(const SubmitTime *t, int recorder) {
+    if (!t->measured) return;
+    timing_add(recorder ? TM_LOCK_REC : TM_LOCK_DIRECT, t->lock_ns);
+    timing_add(recorder ? TM_DRIVER_REC : TM_DRIVER_DIRECT, t->driver_ns);
+    if (recorder) timing_add(TM_REC_QUEUE, t->queue_ns);
+}
+
+
 // ---- consumer
 
 static void exec_packet(uint32_t op, void *p);
@@ -112,10 +153,13 @@ static void wait_space(uint64_t need) {
     Q.tail_seen = __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE);
     if (Q.put_h + need - Q.tail_seen <= RING_WORDS) return;
     RS_.full_waits++;
+    int measure = timing_on();
+    uint64_t t0 = measure ? now_ns() : 0;
     Q.pub_h = Q.put_h;
     __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
     wake();
     while (Q.put_h + need - (Q.tail_seen = __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE)) > RING_WORDS) _mm_pause();
+    if (measure) timing_add(TM_SPACE, now_ns() - t0);
 }
 
 // Room for a packet of bytes of arguments; the caller fills it and calls pub().
@@ -155,14 +199,20 @@ static void pub(void) {
 
 void rec_drain(void) {
     if (!rec_thread || __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE) == Q.put_h) return;
-    uint64_t t0 = now_ns();
+    int measure = timing_on();
+    uint64_t t0 = measure ? now_ns() : 0;
     Q.pub_h = Q.put_h;
     __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
     wake();
     for (int i = 0; __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE) != Q.put_h; i++)
         if (i < 20000) _mm_pause();
         else plat_yield();
-    RS_.drains++, RS_.drain_ns += now_ns() - t0;
+    RS_.drains++;
+    if (measure) {
+        uint64_t ns = now_ns() - t0;
+        RS_.drain_ns += ns;
+        timing_add(TM_DRAIN, ns);
+    }
 }
 
 static int rec_own(void) {
@@ -278,12 +328,15 @@ int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n) {
 }
 
 // At most two command buffers and one signal: the shape vk_sync.c submits.
-typedef struct { uint32_t ncb, nsig; VkCommandBufferSubmitInfo cbi[2]; VkSemaphoreSubmitInfo sig; } A_Submit;
+typedef struct { uint32_t ncb, nsig; uint64_t queued_ns; VkCommandBufferSubmitInfo cbi[2]; VkSemaphoreSubmitInfo sig; } A_Submit;
 VkResult rec_submit(const VkSubmitInfo2 *si) {
+    int measure = timing_on();
+    uint64_t t0 = measure ? now_ns() : 0;
     if (!sub_pending) {
-        vk_queue_lock();
-        VkResult r = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, si, VK_NULL_HANDLE);
-        vk_queue_unlock();
+        SubmitTime t;
+        VkResult r = timed_submit(si, &t);
+        if (measure) timing_add(TM_SUBMIT_DIRECT, now_ns() - t0);
+        timing_submit(&t, 0);
         return r;
     }
     sub_pending = 0;
@@ -295,21 +348,24 @@ VkResult rec_submit(const VkSubmitInfo2 *si) {
     a->ncb = si->commandBufferInfoCount, a->nsig = si->signalSemaphoreInfoCount;
     for (uint32_t i = 0; i < a->ncb; i++) a->cbi[i] = si->pCommandBufferInfos[i];
     if (a->nsig) a->sig = si->pSignalSemaphoreInfos[0];
+    a->queued_ns = measure ? now_ns() : 0;
     pub();
     // Waited for here, so the queue holds every earlier submission when the caller goes on, as with the recorder off:
     // the present, uploads, readbacks and device waits on other threads rely on that order.
     rec_drain();
+    if (measure) timing_add(TM_SUBMIT_REC, now_ns() - t0);
+    timing_submit(&r_submit_time, 1);
     RS_.submits++;
     return r_sub_res;
 }
 
 static void submit_run(const A_Submit *a) {
+    uint64_t queue_ns = a->queued_ns ? now_ns() - a->queued_ns : 0;
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = a->ncb,
                         .pCommandBufferInfos = a->cbi, .signalSemaphoreInfoCount = a->nsig,
                         .pSignalSemaphoreInfos = a->nsig ? &a->sig : NULL};
-    vk_queue_lock();
-    r_sub_res = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, &si, VK_NULL_HANDLE);
-    vk_queue_unlock();
+    r_sub_res = timed_submit(&si, &r_submit_time);
+    r_submit_time.queue_ns = queue_ns;
 }
 
 void rec_stats_log(void) {
@@ -319,6 +375,19 @@ void rec_stats_log(void) {
            (unsigned long long)RS_.parts_on, (unsigned long long)RS_.parts, (unsigned long long)RS_.packets,
            RS_.words * 8 / 1048576.0, (unsigned long long)RS_.drains, (unsigned long long)RS_.fallbacks,
            RS_.drain_ns / 1e6, (unsigned long long)RS_.full_waits, (unsigned long long)RS_.submits);
+    static const char *const names[TM_COUNT] = {
+        "drain_wait", "ring_full_wait", "submit_direct", "submit_recorder",
+        "queue_lock_direct", "queue_driver_direct", "queue_lock_recorder", "queue_driver_recorder", "recorder_queue"
+    };
+    for (int i = 0; i < TM_COUNT; i++) {
+        const RecTiming *t = &timing[i];
+        if (!t->calls) continue;
+        rt_log("vk_rec perf: %s calls=%llu total_ms=%.3f max_us=%.3f bins_us[<10,<100,<1000,>=1000]=%llu/%llu/%llu/%llu",
+               names[i], (unsigned long long)t->calls, t->ns / 1e6, t->max_ns / 1e3,
+               (unsigned long long)t->bins[0], (unsigned long long)t->bins[1],
+               (unsigned long long)t->bins[2], (unsigned long long)t->bins[3]);
+    }
+    memset(timing, 0, sizeof timing);
     memset(&RS_, 0, sizeof RS_);
 }
 
