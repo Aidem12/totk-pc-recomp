@@ -844,8 +844,15 @@ static void upload_cpu(Tex *e) {
     int astc = e->f.astc_bw != 0, rgb = e->f.expand_rgb;
     int agpu = astc && vk_astc_gpu(), acheck = agpu && vk_astc_mode() == VK_ASTC_CHECK;   // raw blocks to the GPU
     uint32_t n = levels * layers, k = 0;
-    VkBufferImageCopy *rg = calloc(n, sizeof *rg);
-    VkAstcRegion *ar = agpu ? calloc(n, sizeof *ar) : NULL;
+    // Small upload descriptions stay local; Vulkan records their values before this call returns.
+    enum { LOCAL_REGIONS = 16 };
+    VkBufferImageCopy local_rg[LOCAL_REGIONS];
+    VkAstcRegion local_ar[LOCAL_REGIONS];
+    VkBufferImageCopy *rg = n <= LOCAL_REGIONS ? local_rg : calloc(n, sizeof *rg);
+    VkAstcRegion *ar = agpu ? (n <= LOCAL_REGIONS ? local_ar : calloc(n, sizeof *ar)) : NULL;
+    if (!rg || (agpu && !ar)) rt_fatal("vk: out of memory (texture upload regions)");
+    if (rg == local_rg) memset(rg, 0, n * sizeof *rg);
+    if (ar == local_ar) memset(ar, 0, n * sizeof *ar);
     VkDeviceSize total = 0, decoded = 0;
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
@@ -934,8 +941,8 @@ static void upload_cpu(Tex *e) {
         vmaDestroyBuffer(vk_ctx()->vma, rbuf, ralloc);
     }
     free(raw_copy);
-    free(ar);
-    free(rg);
+    if (ar != local_ar) free(ar);
+    if (rg != local_rg) free(rg);
 }
 
 // Block-linear storage in an imported pool, deswizzled by the GPU (vk_deswizzle.c): the replay thread only records
