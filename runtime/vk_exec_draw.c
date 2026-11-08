@@ -1056,11 +1056,14 @@ static void upd_apply(const VkExec *ex, uint64_t a, uint8_t *out, size_t n) {
 
 // That address as the bound block holds it at this point of the replay; 0 when the block is unbound or too short. The
 // block has no size field.
-static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
+static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r, int *stable) {
     const p_bind_buf *u = &ex->ubo[st][r->cbuf_slot - 3];
     uint64_t off = (uint64_t)r->handle * 4, a = 0;
     VkMemSpan sp;
+    // Only command payloads (or an invalid binding) are stable within bind_sig. Guest memory can change.
+    if (stable) *stable = 1;
     if (!u->addr || u->size < off + 8 || upd_read(ex, u->addr + off, &a, 8)) return a;
+    if (stable) *stable = 0;
     if (vk_mem_resolve(u->addr + off, 8, &sp)) memcpy(&a, (const void *)(uintptr_t)(u->addr + off), 8);
     return a;
 }
@@ -1073,7 +1076,7 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     p_bind_buf up = {0};
     const p_bind_buf *b = NULL;
     if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
-    else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
+    else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r, NULL), b = &up;   // size 0: up to the end of the backing
     if (b) {
         // vk_caps.c: shaders translated for sbuf_align address the buffer from its address rounded down to it.
         uint64_t lead = vk_caps.sbuf_align ? b->addr & (vk_caps.sbuf_align - 1) : 0;
@@ -1768,7 +1771,9 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
         PUT(ps);
     }
     if (l->c0) PUT(c0_binst);
-    for (int i = 0; i < l->np; i++) PUT(ubo_ptr(ex, l->p[i].st, l->p[i].res));
+    uint64_t ptr[RS_PTRS];
+    int stable[RS_PTRS];
+    for (int i = 0; i < l->np; i++) PUT(ptr[i] = ubo_ptr(ex, l->p[i].st, l->p[i].res, &stable[i]));
     // The uniform overlays the draw's uniform and storage bindings read (op_update_ub): a draw of an updated block binds
     // other bytes after each update, every other draw is left to skip
     if (OV.n) {
@@ -1786,7 +1791,7 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
             }
         }
         for (int i = 0; i < l->np; i++) {   // storage read through an address in a uniform block: no size either
-            uint64_t a = ubo_ptr(ex, l->p[i].st, l->p[i].res);
+            uint64_t a = stable[i] ? ptr[i] : ubo_ptr(ex, l->p[i].st, l->p[i].res, NULL);
             if (a) ov = ov * 1099511628211ull ^ ov_at(ex, a, ov_rest(a));
         }
         PUT(ov);

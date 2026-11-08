@@ -1035,6 +1035,17 @@ ASPECT_SIZES = ('2560x1080', '3440x1440', '3840x1600', '5120x2160', '3840x1080',
                 '1920x1280', '2160x1440', '2256x1504', '2880x1920', '3000x2000')
 
 
+def prepare_profile(ctx):
+    profile = getattr(ctx.options, 'prepare_profile', None) or ctx.state.get('prepare_profile', 'general')
+    if profile not in ('general', 'steam-deck'):
+        raise InstallError('cli.usage', detail=f'Unknown preparation profile: {profile}')
+    return profile
+
+
+def prepare_aspects(ctx):
+    return ('1280x800',) if prepare_profile(ctx) == 'steam-deck' else ASPECT_SIZES
+
+
 class Prepare(Step):
     id = 'prepare'
 
@@ -1044,17 +1055,25 @@ class Prepare(Step):
         tools = [layout.tools / n for n in ('prepare_shaders.py', 'shader_census.py', 'make_romfs_patches.py',
                                             'pack_shader_cache.py', 'ultrawide_layout.py', 'button_icons.py')]
         # not the compile key: a rebuild for the mods' code cheats keeps the prepared shaders
-        return fingerprint('prepare-2', ctx.keys['extract'], runtime_key(ctx), layout.xlate, xlate_id,
+        return fingerprint('prepare-3', prepare_profile(ctx), prepare_aspects(ctx),
+                           ctx.keys['extract'], runtime_key(ctx), layout.xlate, xlate_id,
                            shader_list_text(layout), *tools)
 
     def current(self, ctx, record):
         dest = ctx.dest
         xlate = dest / ctx.layout.xlate.name
-        return ((dest / 'shader-prepared.bin').is_file() and (dest / 'romfs-patches' / 'manifest.tsv').is_file()
+        return (record.get('profile') == prepare_profile(ctx)
+                and record.get('aspects') == list(prepare_aspects(ctx))
+                and (dest / 'shader-prepared.bin').is_file()
+                and all((dest / folder / 'manifest.tsv').is_file()
+                        for folder in ('romfs-patches', *(f'romfs-patches-{size}' for size in prepare_aspects(ctx))))
                 and xlate.is_file() and file_sha256(xlate) == record.get('xlate_sha256'))
 
     def run(self, ctx):
         layout, rep, dest = ctx.layout, ctx.reporter, ctx.dest
+        # Persist before starting tools: a cancelled profile switch resumes with the same output set.
+        ctx.state['prepare_profile'] = prepare_profile(ctx)
+        ctx.save()
         xlate = dest / layout.xlate.name
         if xlate.is_file() and file_sha256(xlate) != file_sha256(layout.xlate):
             # Another translator: its cache keys differ, so the old translations would only take space.
@@ -1085,7 +1104,7 @@ class Prepare(Step):
         # The same overlay with the UI laid out for each game resolution of another shape the settings menu offers
         # (runtime/romfs.c overlay_init picks the one that matches; the camera's side is the patch set aspect,
         # recomp/patches-v<ver>.txt).
-        for size in ASPECT_SIZES:
+        for size in prepare_aspects(ctx):
             remove(dest / f'romfs-patches-{size}')
             code, log = run_tool(ctx, 'prepare', layout.tools / 'make_romfs_patches.py',
                                  ['--version', version_tag(game_version(ctx)), '--romfs', dest / 'romfs', '--out',
@@ -1143,7 +1162,8 @@ class Prepare(Step):
         code, log = run_tool(ctx, 'prepare', layout.tools / 'pack_shader_cache.py', [dest / 'shader-cache'])
         if code:
             raise InstallError('prepare.pack_failed', code=code, log=str(log))
-        return {'xlate_sha256': file_sha256(xlate)}
+        return {'xlate_sha256': file_sha256(xlate), 'profile': prepare_profile(ctx),
+                'aspects': list(prepare_aspects(ctx))}
 
 
 # ---- 7. NVIDIA DLSS

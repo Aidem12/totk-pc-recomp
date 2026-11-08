@@ -247,3 +247,41 @@ bin/                  totk_xlate, hactool, ninja, libSDL3.so.0
 - Re-warm the driver cache on start after a move, GPU or driver change.
 - Per-monitor DPI in the setup window: Tk 9 has none, so a display whose scale differs from the primary one still gets
   the window stretched.
+
+
+## Steam Deck preparation profile
+
+The optional CLI argument `--prepare-profile steam-deck` limits aspect-patch
+preparation to the base `romfs-patches/` (16:9, including 1280x720) and
+`romfs-patches-1280x800/`. It still attempts all existing control prompt variants:
+`romfs-patches-xbox/`, `romfs-patches-xbox-label/` and `romfs-patches-pc/`.
+Their existing optional-failure warnings are unchanged. This reduces aspect/tool
+passes from 19 patch outputs to 5; it does not change game resolution or FPS.
+
+For an existing experimental installation, from a checkout containing these changes:
+
+```sh
+python3 -m installer --dest /path/to/experimental-install --prepare-profile steam-deck
+```
+
+For a first install, append the same option to the normal command with base,
+update, keys, language and destination arguments. No file or key values belong
+in public logs or source control. This option is available in the CLI; no new GUI
+control or automatic hardware detection is added. A new installation without the
+option uses `general`; after a profile has been saved, omitted options (including
+GUI updates) retain that profile. To return to all supported aspects:
+
+```sh
+python3 -m installer --dest /path/to/experimental-install --prepare-profile general
+```
+
+The profile and aspect list participate in the preparation key, and the completed
+record contains both. Current-output checks require every selected aspect's
+manifest. Older records without profile metadata require preparation once.
+Extraction and compilation keys do not depend on this option. Existing shader
+cache reuse and translation checks remain in effect when Prepare runs.
+
+The selection is saved before preparation tools start, so cancellation resumes
+with that selection, while the runner records completion only after all required
+steps succeed. Extra aspect folders from an older general installation are left
+in place; the Deck profile does not regenerate them or delete user files.

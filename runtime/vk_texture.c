@@ -1938,14 +1938,30 @@ static void write_back_n(Tex **v, int n) {
     for (int i = 0; i < n; i++) v[i]->gpu_dirty = 0;
 }
 
+// Candidate lists live only until write_back_n returns. tex_lock keeps nowned and the pointers stable.
+// Grow once, only when a seventeenth candidate is found; no heap allocation for an empty or small result.
+#define WB_LOCAL_HITS 16
+typedef struct { Tex *local[WB_LOCAL_HITS]; Tex **p; int n; } WbHits;
+
+static void wb_hit_add(WbHits *hits, Tex *e) {
+    if (hits->n == WB_LOCAL_HITS) {
+        Tex **p = malloc(sizeof *p * (size_t)nowned);
+        if (!p) rt_fatal("vk: out of memory for a texture write-back");
+        memcpy(p, hits->local, sizeof hits->local);
+        hits->p = p;
+    }
+    hits->p[hits->n++] = e;
+}
+
 // Mirrored textures overlapping [addr, addr+size) that the GPU wrote since their last write-back.
-static int owned_dirty(uint64_t addr, uint64_t size, Tex **hit) {
+static int owned_dirty(uint64_t addr, uint64_t size, WbHits *hit) {
     int n = 0;
     for (int i = owned_lower(addr > max_owned ? addr - max_owned : 0); i < nowned && owned[i]->pub.addr < addr + size; i++) {
         Tex *e = owned[i];
         if (__atomic_load_n(&e->gpu_dirty, __ATOMIC_RELAXED) && e->pub.addr + e->t.L.size > addr) {
             if (!hit) return 1;
-            hit[n++] = e;
+            wb_hit_add(hit, e);
+            n++;
         }
     }
     return n;
@@ -2003,9 +2019,9 @@ uint64_t vk_texture_dirty_fence(uint64_t addr, uint64_t size) {
 // first, so where two descriptors share storage the newer render wins.
 void vk_texture_write_back(uint64_t addr, uint64_t size) {
     lock();
-    Tex **hit = malloc(sizeof *hit * (size_t)(nowned + 1));
-    if (!hit) rt_fatal("vk: out of memory for a texture write-back");
-    int n = owned_dirty(addr, size, hit), k = 0;   // owned[] cannot change while tex_lock is held
+    WbHits hits = {.p = hits.local};
+    int n = owned_dirty(addr, size, &hits), k = 0;   // owned[] cannot change while tex_lock is held
+    Tex **hit = hits.p;
     for (int i = 0; i < n; i++) {
         uint32_t now;
         if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;
@@ -2019,7 +2035,7 @@ void vk_texture_write_back(uint64_t addr, uint64_t size) {
     write_back_n(hit, k);
     for (int i = 0; i < k; i++) perf_count(PERF_CNT_WB);
     for (int i = k; i < n; i++) perf_count(PERF_CNT_WB_SKIP);
-    free(hit);
+    if (hit != hits.local) free(hit);
     unlock();
 }
 
@@ -2055,11 +2071,8 @@ void vk_texture_write_back_small(uint64_t fence) {
     wb_cfg_init();
     __atomic_store_n(&small_pending, 0, __ATOMIC_RELAXED);
     plat_mutex_lock_shared(&owned_lock);
-    int n = 0, later = 0;
-    for (int i = 0; i < nowned; i++) n += owned[i]->gpu_dirty && wb_wanted(owned[i]);
-    Tex **hit = n ? malloc(sizeof *hit * (size_t)n) : NULL;
-    if (n && !hit) rt_fatal("vk: out of memory for a texture write-back");
-    n = 0;
+    WbHits hits = {.p = hits.local};
+    int later = 0;
     for (int i = 0; i < nowned; i++) {
         Tex *e = owned[i];
         if (!e->gpu_dirty) continue;
@@ -2073,12 +2086,13 @@ void vk_texture_write_back_small(uint64_t fence) {
         if (e->gpu_fence > fence) later = 1;
         else {
             if (wb_trace && e->t.L.size > WB_SMALL_DEFAULT) wb_note(e, 0);
-            hit[n++] = e;
+            wb_hit_add(&hits, e);
         }
     }
     plat_mutex_unlock_shared(&owned_lock);
     if (later) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
-    int k = 0;
+    Tex **hit = hits.p;
+    int n = hits.n, k = 0;
     for (int i = 0; i < n; i++) {
         uint32_t now;
         if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;
@@ -2092,7 +2106,7 @@ void vk_texture_write_back_small(uint64_t fence) {
     write_back_n(hit, k);
     for (int i = 0; i < k; i++) perf_count(PERF_CNT_WB);
     for (int i = k; i < n; i++) perf_count(PERF_CNT_WB_SKIP);
-    free(hit);
+    if (hit != hits.local) free(hit);
     unlock();
 }
 
