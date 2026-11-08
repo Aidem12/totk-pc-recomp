@@ -1289,4 +1289,4 @@ def romfs_problem(romfs, expected):
 
 
 def all_steps():
-    return [Check(), Fonts(), Extract(), Lift(), Compile(), Prepare(), Dlss(), Cleanup()]
+    return [Check(), Fonts(), Extract(), Lift(), Compile(), Prepare(), *([Dlss()] if os.name == 'nt' else []), Cleanup()]

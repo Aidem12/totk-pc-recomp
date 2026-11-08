@@ -12,6 +12,7 @@ disk is intact (an unbuffered read of install-test's romfs.bin gives the expecte
 not the installer. It is also skipped when build/install-test is absent.
 """
 import io
+import ast
 import json
 import os
 import queue
@@ -327,6 +328,82 @@ class CatalogTest(unittest.TestCase):
     def test_chinese_window_starts_with_a_game_language_that_needs_no_shared_fonts(self):
         self.assertEqual(default_game_language('zh-Hans'), 'en-US')
         self.assertEqual(default_game_language('ru'), 'ru')
+
+
+class SteamDeckInstallerTest(unittest.TestCase):
+    def test_spanish_locales_and_game_default(self):
+        from installer import guilogic
+        for locale in ('es', 'es_MX.UTF-8', 'es_ES', 'es_419', 'es-AR', 'ES_mx'):
+            with unittest.mock.patch.object(guilogic, 'os', SimpleNamespace(name='posix', environ={'LANG': locale})):
+                self.assertEqual(windows_ui_language(), 'es')
+        with unittest.mock.patch.object(guilogic, 'os', SimpleNamespace(
+                name='posix', environ={'LANG': 'es_MX', 'LC_ALL': 'en_US'})):
+            self.assertEqual(windows_ui_language(), 'en')
+        self.assertEqual(default_game_language('es'), 'en-US')
+        self.assertEqual(UI_LANGUAGE_LABELS['es'], 'Español')
+        self.assertEqual(len(UI_LANGUAGES), 5)
+
+    def test_linux_command_and_progress_exclude_dlss(self):
+        from installer import guilogic
+        with unittest.mock.patch.object(guilogic, 'os', SimpleNamespace(name='posix')):
+            self.assertNotIn('--dlss', Form(dlss=True).command('python'))
+            self.assertNotIn('dlss', Model().steps)
+            m = Model()
+            m.apply({'type': 'start'})
+            self.assertEqual(m.steps, ['check', 'fonts', 'extract', 'lift', 'compile', 'prepare', 'cleanup'])
+
+    def test_linux_step_factory_and_direct_dlss_guard(self):
+        # Exercise the actual small definitions without importing the game's extractor dependencies.
+        from installer.runner import Step
+        tree = ast.parse((ROOT / 'installer/steps.py').read_text(encoding='utf-8'))
+        selected = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))
+                    and n.name in ('all_steps', 'Dlss')]
+        env = {'Step': Step, 'os': SimpleNamespace(name='posix')}
+        for name in ('Check', 'Fonts', 'Extract', 'Lift', 'Compile', 'Prepare', 'Cleanup'):
+            env[name] = type(name, (), {'id': name.lower()})
+        exec(compile(ast.Module(body=selected, type_ignores=[]), 'installer/steps.py', 'exec'), env)
+        self.assertEqual([s.id for s in env['all_steps']()],
+                         ['check', 'fonts', 'extract', 'lift', 'compile', 'prepare', 'cleanup'])
+        self.assertEqual(env['Dlss']().run(SimpleNamespace(options=SimpleNamespace(dlss=True))),
+                         {'skipped': 'not_windows'})
+        env['os'] = SimpleNamespace(name='nt')
+        self.assertIn('dlss', [s.id for s in env['all_steps']()])
+
+    @unittest.skipIf(gui is None, 'no tkinter')
+    def test_linux_window_and_spanish_switch(self):
+        import tkinter as tk
+        from installer import guilogic
+        class LinuxOS:
+            name = 'posix'
+            def __getattr__(self, name):
+                return getattr(os, name)
+        with tempfile.TemporaryDirectory() as temp, unittest.mock.patch.dict(os.environ, {recent.ENV: str(Path(temp) / 'setup.json')}):
+            root = tk.Tk()
+            try:
+                with unittest.mock.patch.object(gui, 'os', LinuxOS()), unittest.mock.patch.object(guilogic, 'os', LinuxOS()):
+                    app = gui.App(root, 'en', layouts.find(ROOT))
+                    self.assertFalse(app.dlss_var.get())
+                    self.assertFalse(any(ident in ('ui.dlss', 'ui.dlss_help') for _, _, ident, _ in app.bound))
+                    app.lang_code = 'es-419'
+                    app.vars['lang'].set(app.lang_label('es-419'))
+                    for lang in UI_LANGUAGES:
+                        app.ui_var.set(lang)
+                        app.switch_language()
+                        self.assertEqual(app.selected_lang(), 'es-419')
+                        for screen in ('form', 'run', 'finish'):
+                            app.show(screen)
+                            root.update()
+                            self.assertTrue(app.fork_label.winfo_ismapped())
+                            self.assertEqual(app.fork_label.cget('text'), 'Aidem12 Fork - Steam Deck Edition')
+                            self.assertGreaterEqual(app.fork_label.winfo_width(), app.fork_label.winfo_reqwidth())
+                            self.assertEqual(app.fork_label.cget('background'), '#19364B')
+                            if lang == 'es':
+                                for widget, option, ident, _ in app.bound:
+                                    if option == 'text' and widget.winfo_ismapped():
+                                        self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth(), ident)
+                                        self.assertGreaterEqual(widget.winfo_height(), widget.winfo_reqheight(), ident)
+            finally:
+                root.destroy()
 
 
 BREAK_CHILD = 'import time\nprint("ready", flush=True)\ntime.sleep(60)\n'

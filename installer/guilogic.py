@@ -24,9 +24,9 @@ from . import state as statefile
 from .events import render
 
 TEXT = Path(__file__).resolve().parent / 'text'
-UI_LANGUAGES = ('en', 'ru', 'pt-BR', 'zh-Hans')
+UI_LANGUAGES = ('en', 'ru', 'pt-BR', 'zh-Hans', 'es')
 # what the language switch in the window's corner shows for each
-UI_LANGUAGE_LABELS = {'en': 'English', 'ru': 'Русский', 'pt-BR': 'Português (Brasil)', 'zh-Hans': '简体中文'}
+UI_LANGUAGE_LABELS = {'en': 'English', 'ru': 'Русский', 'pt-BR': 'Português (Brasil)', 'zh-Hans': '简体中文', 'es': 'Español'}
 STEP_ORDER = ('check', 'fonts', 'extract', 'lift', 'compile', 'prepare', 'dlss', 'cleanup')
 # message parameter -> catalog id prefix of the names that replace its raw values
 PARAM_NAMES = {'lang': 'lang.', 'known': 'lang.', 'step': 'step.', 'input': 'param.input.'}
@@ -35,6 +35,10 @@ LANG_PT_BR = 0x0416   # Portuguese (Brazil), the whole LANGID: Portugal's Portug
 # Windows LANGIDs that write Simplified Chinese: zh-CN, zh-SG. zh-TW, zh-HK and zh-MO write Traditional Chinese, which
 # the window does not have.
 LANGIDS_ZH_HANS = (0x0804, 0x1004)
+
+
+def step_order():
+    return tuple(s for s in STEP_ORDER if s != 'dlss' or os.name == 'nt')
 
 
 def load_texts(lang):
@@ -83,10 +87,11 @@ def flat(value):
 
 def windows_ui_language():
     """The window language for the display language: the Windows one (ui_language_for_langid); elsewhere LC_ALL,
-    LC_MESSAGES or LANG ('ru', 'pt_BR', 'zh_CN' or 'zh_SG', else English)."""
+    LC_MESSAGES or LANG ('es', 'ru', 'pt_BR', 'zh_CN' or 'zh_SG', else English)."""
     if os.name != 'nt':
         loc = (os.environ.get('LC_ALL') or os.environ.get('LC_MESSAGES') or os.environ.get('LANG') or '').lower()
-        return ('ru' if loc.startswith('ru') else 'pt-BR' if loc.startswith(('pt_br', 'pt-br'))
+        return ('es' if loc.split('_')[0].split('-')[0].split('.')[0].split('@')[0] == 'es'
+                else 'ru' if loc.startswith('ru') else 'pt-BR' if loc.startswith(('pt_br', 'pt-br'))
                 else 'zh-Hans' if loc.startswith(('zh_cn', 'zh-cn', 'zh_sg', 'zh-sg', 'zh_hans', 'zh-hans')) else 'en')
     try:
         langid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
@@ -97,7 +102,9 @@ def windows_ui_language():
 
 def ui_language_for_langid(langid):
     """'ru' for a Russian Windows LANGID, 'pt-BR' for Brazilian Portuguese, 'zh-Hans' for a Simplified Chinese one,
-    else 'en'."""
+    'es' for Spanish, else 'en'."""
+    if langid & 0x3ff == 0x0a:   # Spanish, including regional variants
+        return 'es'
     if langid & 0x3ff == LANG_RU:
         return 'ru'
     if langid == LANG_PT_BR:
@@ -188,7 +195,7 @@ class Form:
             cmd += ['--temp', str(temp)]
         if verify_hashes:
             cmd.append('--verify')
-        if self.dlss:
+        if self.dlss and os.name == 'nt':
             cmd.append('--dlss')
         return cmd
 
@@ -214,7 +221,7 @@ class Model:
     """What the window shows, folded from events. apply() takes one event; nothing else mutates it."""
 
     def __init__(self):
-        self.steps = list(STEP_ORDER)
+        self.steps = list(step_order())
         self.states = {s: PENDING for s in self.steps}
         self.mode = ''
         self.release = ''
@@ -235,7 +242,7 @@ class Model:
         kind = e['type']
         if kind == 'start':
             self.__init__()   # a new run: nothing of an earlier one stays
-            self.steps = list(e.get('steps') or STEP_ORDER)
+            self.steps = list(e.get('steps') or step_order())
             self.states = {s: PENDING for s in self.steps}
             self.mode, self.release = e.get('mode', ''), e.get('release', '')
             self.log_path, self.dest = e.get('log', ''), e.get('dest', '')
