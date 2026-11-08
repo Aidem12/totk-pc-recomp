@@ -312,7 +312,10 @@ static void ub_written(VkExec *ex, uint64_t addr, uint64_t n);
 
 static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
     CbRes *r = cb_res(ex);
-    for (int i = 0; i < r->nwritten; i++)
+    // Check the most recently added range first, keeping exact-range deduplication.
+    int last = r->nwritten - 1;
+    if (last >= 0 && r->written[last].addr == addr && r->written[last].size == size) return;
+    for (int i = 0; i < last; i++)
         if (r->written[i].addr == addr && r->written[i].size == size) return;
     if (r->nwritten == r->cwritten) r->written = grow(r->written, &r->cwritten, sizeof *r->written);
     r->written[r->nwritten++] = (Range){addr, size};
