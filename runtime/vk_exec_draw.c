@@ -3092,14 +3092,6 @@ int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth
     return 1;
 }
 
-static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType type) {
-    VkBuffer b;
-    VkDeviceSize o;
-    memcpy(scratch(ex, bytes, &b, &o), data, bytes);
-    vkCmdBindIndexBuffer(ex->cb, b, o, type);
-    ex->recorded++;
-}
-
 static void op_draw(VkExec *ex, const p_draw *d) {
     c0_binst = (uint32_t)d->base_instance;
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, 0)) return;
@@ -3166,14 +3158,15 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
         if (sp.alloc) return warn_once(W_INDEX, "byte indices in device-local memory: draw skipped");
         vk_mem_count(sp.cls, VK_MUSE_CPU_READ, bytes);
         vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_IB, 2 * bytes);
-        uint16_t *ix = malloc(sizeof *ix * (size_t)d->count);
-        if (!ix) rt_fatal("vk: out of memory");
+        VkBuffer ib;
+        VkDeviceSize io;
+        uint16_t *ix = (uint16_t *)scratch(ex, sizeof *ix * (uint64_t)d->count, &ib, &io);
         for (int i = 0; i < d->count; i++) {
             uint8_t v = ((const uint8_t *)(uintptr_t)d->ibuf)[i];
             ix[i] = restart && v == 0xff ? 0xffff : v;
         }
-        bind_index(ex, ix, sizeof *ix * (size_t)d->count, VK_INDEX_TYPE_UINT16);
-        free(ix);
+        vkCmdBindIndexBuffer(ex->cb, ib, io, VK_INDEX_TYPE_UINT16);
+        ex->recorded++;
     } else if (sp.offset % isize[d->itype]) {
         return warn_once(W_INDEX, "index buffer %#llx is not aligned to its index size: draw skipped", (unsigned long long)d->ibuf);
     } else {
