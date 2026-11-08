@@ -99,6 +99,8 @@ static struct {
     VkPipeline pipe[2];                  // bound per bind point: 0 graphics, 1 compute
     VkPipeState st;                      // the state vk_pipeline_set_dynamic last recorded
     int st_valid;
+    int dyn_valid;                       // vk_pipeline_set_dynamic_delta's record of this command buffer's dynamic state
+                                         // holds (TOTK_DYN_DELTA); pipeline binds keep it, the memset clears it
     uint32_t vmask;                      // the vertex bindings st's vertex input reads (valid with st_valid)
     uint32_t vres;                       // the streams whose vb entry was resolved from vin (others: the zero buffer)
     VkBuffer vb[17];                     // vertex buffers last bound
@@ -139,6 +141,10 @@ static struct {
     uint64_t draws, bind[2], desc[2], push, push_skip, set_new, set_reuse, ac_miss, same_prog, same_all, bind_skip;
 } BS = {-1};
 
+// TOTK_DYN_DELTA (prepare_draw): the mode and, for the perf line, the set_dynamic calls, the commands they recorded
+// (a full call counts 1) and the calls that recorded none.
+static struct { int mode; uint64_t calls, cmds, empty; } DD = {-1};
+
 // The inputs of the last graphics bind_resources (bind_sig) and what its build counted for the traffic census, which a
 // skipped build counts again. RS_BYTES bounds the bound-slot bytes a pipeline reads (RsList): per binding at most one
 // c0 storage table, otherwise one bound range or handle per descriptor.
@@ -175,7 +181,8 @@ static struct {
     struct { uint64_t dst; VkBuffer src; VkDeviceSize soff; VkMemSpan sp; uint64_t size; } p[OV_N];   // to copy
     struct { uint64_t lo, hi; } f[OV_FOREIGN];   // GPU writes of other kinds
     // since the last perf line (vk_exec_ub_perf)
-    uint64_t c_update, c_overlaid, c_flush, c_bind, c_merged, c_mixed, c_inpass, c_outside, c_early;
+    uint64_t c_update, c_overlaid, c_overlaid_out, c_flush, c_bind, c_merged, c_mixed, c_inpass, c_outside, c_early,
+        c_order;
 } OV = {.mode = -1};
 
 // A binding without a size reaches to the end of its backing: as far as the overlays go, for ov_at.
@@ -305,7 +312,10 @@ static void ub_written(VkExec *ex, uint64_t addr, uint64_t n);
 
 static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
     CbRes *r = cb_res(ex);
-    for (int i = 0; i < r->nwritten; i++)
+    // Check the most recently added range first, keeping exact-range deduplication.
+    int last = r->nwritten - 1;
+    if (last >= 0 && r->written[last].addr == addr && r->written[last].size == size) return;
+    for (int i = 0; i < last; i++)
         if (r->written[i].addr == addr && r->written[i].size == size) return;
     if (r->nwritten == r->cwritten) r->written = grow(r->written, &r->cwritten, sizeof *r->written);
     r->written[r->nwritten++] = (Range){addr, size};
@@ -586,6 +596,10 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     if (img->block_views) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views' (vk_texture.c)
     VkImageView view;
     if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (img->gone) {   // dropped since the lookup: its views were purged and a new one would outlive the image
+        vk_defer_view(view);
+        return view;
+    }
     ViewNode *n = malloc(sizeof *n);
     if (!n) rt_fatal("vk: out of memory");
     *n = (ViewNode){nvn_hm_get(&views_by_image, &img->image), k, view};
@@ -612,11 +626,15 @@ VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageV
         if (blocks) ci.pNext = &use;   // not the BC image's sampling and transfer usages
         if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS)
             rt_fatal("vk: render target view (format %d) could not be created", (int)format);
-        ViewNode *n = malloc(sizeof *n);
-        if (!n) rt_fatal("vk: out of memory");
-        *n = (ViewNode){nvn_hm_get(&views_by_image, &img->image), k, view};
-        nvn_hm_put(&views_by_image, &img->image, n);
-        nvn_hm_put(&view_of, &k, (void *)view);
+        if (img->gone) {   // dropped since resolve_target (get_view)
+            vk_defer_view(view);
+        } else {
+            ViewNode *n = malloc(sizeof *n);
+            if (!n) rt_fatal("vk: out of memory");
+            *n = (ViewNode){nvn_hm_get(&views_by_image, &img->image), k, view};
+            nvn_hm_put(&views_by_image, &img->image, n);
+            nvn_hm_put(&view_of, &k, (void *)view);
+        }
     }
     vk_texture_unlock();
     return view;
@@ -1038,11 +1056,14 @@ static void upd_apply(const VkExec *ex, uint64_t a, uint8_t *out, size_t n) {
 
 // That address as the bound block holds it at this point of the replay; 0 when the block is unbound or too short. The
 // block has no size field.
-static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
+static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r, int *stable) {
     const p_bind_buf *u = &ex->ubo[st][r->cbuf_slot - 3];
     uint64_t off = (uint64_t)r->handle * 4, a = 0;
     VkMemSpan sp;
+    // Only command payloads (or an invalid binding) are stable within bind_sig. Guest memory can change.
+    if (stable) *stable = 1;
     if (!u->addr || u->size < off + 8 || upd_read(ex, u->addr + off, &a, 8)) return a;
+    if (stable) *stable = 0;
     if (vk_mem_resolve(u->addr + off, 8, &sp)) memcpy(&a, (const void *)(uintptr_t)(u->addr + off), 8);
     return a;
 }
@@ -1055,7 +1076,7 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     p_bind_buf up = {0};
     const p_bind_buf *b = NULL;
     if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
-    else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
+    else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r, NULL), b = &up;   // size 0: up to the end of the backing
     if (b) {
         // vk_caps.c: shaders translated for sbuf_align address the buffer from its address rounded down to it.
         uint64_t lead = vk_caps.sbuf_align ? b->addr & (vk_caps.sbuf_align - 1) : 0;
@@ -1750,7 +1771,9 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
         PUT(ps);
     }
     if (l->c0) PUT(c0_binst);
-    for (int i = 0; i < l->np; i++) PUT(ubo_ptr(ex, l->p[i].st, l->p[i].res));
+    uint64_t ptr[RS_PTRS];
+    int stable[RS_PTRS];
+    for (int i = 0; i < l->np; i++) PUT(ptr[i] = ubo_ptr(ex, l->p[i].st, l->p[i].res, &stable[i]));
     // The uniform overlays the draw's uniform and storage bindings read (op_update_ub): a draw of an updated block binds
     // other bytes after each update, every other draw is left to skip
     if (OV.n) {
@@ -1768,7 +1791,7 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
             }
         }
         for (int i = 0; i < l->np; i++) {   // storage read through an address in a uniform block: no size either
-            uint64_t a = ubo_ptr(ex, l->p[i].st, l->p[i].res);
+            uint64_t a = stable[i] ? ptr[i] : ubo_ptr(ex, l->p[i].st, l->p[i].res, NULL);
             if (a) ov = ov * 1099511628211ull ^ ov_at(ex, a, ov_rest(a));
         }
         PUT(ov);
@@ -2289,8 +2312,20 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (!p || !info) return warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), 0;
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
-        B.vmask = vk_pipeline_set_dynamic(ex->cb, &s);
-        ex->recorded++;
+        // TOTK_DYN_DELTA: only the dynamic states whose values changed since the last call in this command buffer. A
+        // pipeline bind clears st_valid but not dyn_valid: every pipeline here declares the same dynamic states, which
+        // the bind leaves as they were (the viewport, scissor and stencil values of record_fixed rely on that too).
+        if (DD.mode < 0) DD.mode = rt_knob("DYN_DELTA", "1");
+        uint32_t cmds = 1;
+        if (RT_KNOB_ON(DD.mode)) {
+            B.vmask = vk_pipeline_set_dynamic_delta(ex->cb, &s, B.dyn_valid, &cmds);
+            B.dyn_valid = 1;
+        } else {
+            B.vmask = vk_pipeline_set_dynamic(ex->cb, &s);
+            B.dyn_valid = 0;   // the delta's record is stale from here on
+        }
+        DD.calls++, DD.cmds += cmds, DD.empty += !cmds;
+        ex->recorded += cmds != 0;
         B.st = s, B.st_valid = 1;
         if (ex->mark && vk_exec_frame.draws == ex->mark_draws0) ex->mark->first[0] = vs, ex->mark->first[1] = fs;
     }
@@ -3065,14 +3100,6 @@ int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth
     return 1;
 }
 
-static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType type) {
-    VkBuffer b;
-    VkDeviceSize o;
-    memcpy(scratch(ex, bytes, &b, &o), data, bytes);
-    vkCmdBindIndexBuffer(ex->cb, b, o, type);
-    ex->recorded++;
-}
-
 static void op_draw(VkExec *ex, const p_draw *d) {
     c0_binst = (uint32_t)d->base_instance;
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, 0)) return;
@@ -3080,22 +3107,25 @@ static void op_draw(VkExec *ex, const p_draw *d) {
     uint32_t inst = d->instances > 0 ? (uint32_t)d->instances : 1, first = (uint32_t)d->first, n = (uint32_t)d->count;
     if (d->prim == NVN_DRAW_PRIMITIVE_QUADS && n >= 4) {   // quads become two triangles each
         uint32_t q = n / 4;
-        uint32_t *ix = malloc(sizeof *ix * 6 * q);
-        if (!ix) rt_fatal("vk: out of memory");
+        VkBuffer ib;
+        VkDeviceSize io;
+        // Generate in the submission's scratch; cb_done keeps it alive until the fence completes.
+        uint32_t *ix = (uint32_t *)scratch(ex, sizeof *ix * 6 * (uint64_t)q, &ib, &io);
         for (uint32_t i = 0; i < q; i++) {
             uint32_t v = first + 4 * i, k[6] = {0, 1, 2, 0, 2, 3};
             for (int j = 0; j < 6; j++) ix[6 * i + j] = v + k[j];
         }
-        bind_index(ex, ix, sizeof *ix * 6 * q, VK_INDEX_TYPE_UINT32);
-        free(ix);
+        vkCmdBindIndexBuffer(ex->cb, ib, io, VK_INDEX_TYPE_UINT32);
+        ex->recorded++;
         vkCmdDrawIndexed(ex->cb, 6 * q, inst, 0, 0, (uint32_t)d->base_instance);
     } else if (d->prim == NVN_DRAW_PRIMITIVE_LINE_LOOP && n >= 2) {   // a strip that returns to its first vertex
-        uint32_t *ix = malloc(sizeof *ix * (n + 1));
-        if (!ix) rt_fatal("vk: out of memory");
+        VkBuffer ib;
+        VkDeviceSize io;
+        uint32_t *ix = (uint32_t *)scratch(ex, sizeof *ix * ((uint64_t)n + 1), &ib, &io);
         for (uint32_t i = 0; i < n; i++) ix[i] = first + i;
         ix[n] = first;
-        bind_index(ex, ix, sizeof *ix * (n + 1), VK_INDEX_TYPE_UINT32);
-        free(ix);
+        vkCmdBindIndexBuffer(ex->cb, ib, io, VK_INDEX_TYPE_UINT32);
+        ex->recorded++;
         vkCmdDrawIndexed(ex->cb, n + 1, inst, 0, 0, (uint32_t)d->base_instance);
     } else {
         vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance);
@@ -3136,14 +3166,15 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
         if (sp.alloc) return warn_once(W_INDEX, "byte indices in device-local memory: draw skipped");
         vk_mem_count(sp.cls, VK_MUSE_CPU_READ, bytes);
         vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_IB, 2 * bytes);
-        uint16_t *ix = malloc(sizeof *ix * (size_t)d->count);
-        if (!ix) rt_fatal("vk: out of memory");
+        VkBuffer ib;
+        VkDeviceSize io;
+        uint16_t *ix = (uint16_t *)scratch(ex, sizeof *ix * (uint64_t)d->count, &ib, &io);
         for (int i = 0; i < d->count; i++) {
             uint8_t v = ((const uint8_t *)(uintptr_t)d->ibuf)[i];
             ix[i] = restart && v == 0xff ? 0xffff : v;
         }
-        bind_index(ex, ix, sizeof *ix * (size_t)d->count, VK_INDEX_TYPE_UINT16);
-        free(ix);
+        vkCmdBindIndexBuffer(ex->cb, ib, io, VK_INDEX_TYPE_UINT16);
+        ex->recorded++;
     } else if (sp.offset % isize[d->itype]) {
         return warn_once(W_INDEX, "index buffer %#llx is not aligned to its index size: draw skipped", (unsigned long long)d->ibuf);
     } else {
@@ -3254,11 +3285,11 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
 // it read the new bytes, those before it the old ones. Replayed as a buffer copy at that point it needs a barrier
 // against the earlier draws, and a barrier ends the open pass; the terrain and the sky islands' meshes update before
 // most of their draws, about 200 updates inside passes in a field submission, each a pass end, a full barrier and a
-// pass begin. Here an update inside a pass goes into the scratch buffer as an overlay: the later bindings of a range it
-// covers bind the scratch bytes (ub_bind, from ubo_info and bind_range), and the copies into the real buffers wait for
-// the next full barrier, where the pass has ended anyway (vk_exec_ub_flush from vk_exec.c barrier_to: a pass end, a
-// dispatch, a transfer, the end of the submission), behind one barrier of their own. Each draw reads the bytes it would
-// have read with the copy in between.
+// pass begin. Here an update inside a pass, and with TOTK_UB_OVERLAY_OUT one between passes, goes into the scratch
+// buffer as an overlay: the later bindings of a range it covers bind the scratch bytes (ub_bind, from ubo_info and
+// bind_range), and the copies into the real buffers wait for the next full barrier, where the pass has ended anyway
+// (vk_exec_ub_flush from vk_exec.c barrier_to: a pass end, a dispatch, a transfer, the end of the submission), behind
+// one barrier of their own. Each draw reads the bytes it would have read with the copy in between.
 // - A GPU write of another kind (a copy, a fill, a shader's storage write) is ordered with the copies only by the
 //   command buffer. vk_exec_ub_foreign notes it and retires the overlays it touches; an update over such bytes takes
 //   the old path. A shader that writes a range with copies pending gets them first (ub_written: the pass restarts).
@@ -3272,6 +3303,16 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
 static int ov_on(void) {
     if (OV.mode < 0) OV.mode = rt_knob("UB_OVERLAY", "1");
     return RT_KNOB_ON(OV.mode);
+}
+
+// TOTK_UB_OVERLAY_OUT: updates between passes become overlays too. Copied at once, each needs a full barrier of its
+// own, and the copy it records makes the next update or pass begin need another: a run of k updates before a pass cost
+// k + 1 barriers. Every GPU reader of the real buffer after them comes behind barrier_to, which records the copies
+// first (a pass begin, a dispatch, a transfer, the end of the submission), so they cost one barrier for the run.
+static int ov_out_on(void) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("UB_OVERLAY_OUT", "1");
+    return RT_KNOB_ON(mode);
 }
 
 static void ov_sub(const VkExec *ex) {   // the submission being replayed
@@ -3349,27 +3390,61 @@ void vk_exec_ub_flush(VkExec *ex) {
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vkCmdPipelineBarrier2(ex->cb, &di);
     ex->recorded++;
+    // Copies without a barrier between them may run in any order, and ov_add only drops an older copy of exactly the
+    // same range: a copy that overlaps one recorded since the last barrier waits for it, so the newer bytes land last.
+    VkMemoryBarrier2 ww = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT};
+    VkDependencyInfo wdi = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &ww};
+    uint32_t since = 0;   // the first copy recorded after the last barrier
+    uint64_t lo = UINT64_MAX, hi = 0;
     for (uint32_t i = 0; i < OV.np; i++) {
+        uint64_t dst = OV.p[i].dst, end = dst + OV.p[i].size;
+        // A disjoint bounding interval cannot overlap any copy since the last barrier.
+        if (dst < hi && lo < end) {
+            for (uint32_t k = since; k < i; k++)
+                if (OV.p[i].dst < OV.p[k].dst + OV.p[k].size && OV.p[k].dst < OV.p[i].dst + OV.p[i].size) {
+                    vkCmdPipelineBarrier2(ex->cb, &wdi);
+                    ex->recorded++;
+                    OV.c_order++;
+                    since = i;
+                    lo = UINT64_MAX, hi = 0;
+                    break;
+                }
+        }
+        if (dst < lo) lo = dst;
+        if (end > hi) hi = end;
         VkBufferCopy cp = {OV.p[i].soff, OV.p[i].sp.offset, OV.p[i].size};
         vkCmdCopyBuffer(ex->cb, OV.p[i].src, OV.p[i].sp.buffer, 1, &cp);
         ex->recorded++;
     }
     OV.np = 0;
+    // The full barrier barrier_to records next makes the copied bytes visible: later bindings read the real buffer,
+    // as after an update copied at once, and need no overlay lookups or merged copies (ov_at answers 0 for them, so
+    // the descriptor build skip rebuilds the draws that bound an overlay)
+    OV.n = 0;
+    ov_span();
     OV.c_flush++;
 }
 
 // TOTK_TRACE=perf, every 600 submissions: per submission, the updates and how many stayed in their pass.
 void vk_exec_ub_perf(void) {
-    static unsigned subs;
+    static unsigned subs, dsubs;
+    if (DD.mode >= 0 && ++dsubs % 600 == 0 && DD.calls) {
+        rt_log("perf: dynamic state per submission: %.1f calls, %.1f commands (a full set counts 1), %.1f calls with "
+               "nothing changed%s", DD.calls / 600.0, DD.cmds / 600.0, DD.empty / 600.0,
+               DD.mode == 2 ? " (TOTK_DYN_DELTA=ab)" : DD.mode ? "" : " (TOTK_DYN_DELTA=0)");
+        DD.calls = DD.cmds = DD.empty = 0;
+    }
     if (OV.mode <= 0 || ++subs % 600) return;
     const double k = 1 / 600.0;
-    rt_log("perf: uniform updates per submission %.1f: %.1f overlaid in a pass (copied in %.2f batches), %.1f copied "
-           "in a pass, %.1f outside one; bindings from an overlay %.1f (%.1f merged, %.1f over other GPU writes), %.2f "
-           "batches brought forward for a storage write",
-           OV.c_update * k, OV.c_overlaid * k, OV.c_flush * k, OV.c_inpass * k, OV.c_outside * k, OV.c_bind * k,
-           OV.c_merged * k, OV.c_mixed * k, OV.c_early * k);
-    OV.c_update = OV.c_overlaid = OV.c_flush = OV.c_bind = OV.c_merged = OV.c_mixed = 0;
-    OV.c_inpass = OV.c_outside = OV.c_early = 0;
+    rt_log("perf: uniform updates per submission %.1f: %.1f overlaid (%.1f of them between passes; copied in %.2f "
+           "batches), %.1f copied in a pass, %.1f outside one; bindings from an overlay %.1f (%.1f merged, %.1f over "
+           "other GPU writes), %.2f batches brought forward for a storage write, %.2f barriers between overlapping copies",
+           OV.c_update * k, OV.c_overlaid * k, OV.c_overlaid_out * k, OV.c_flush * k, OV.c_inpass * k, OV.c_outside * k,
+           OV.c_bind * k, OV.c_merged * k, OV.c_mixed * k, OV.c_early * k, OV.c_order * k);
+    OV.c_update = OV.c_overlaid = OV.c_overlaid_out = OV.c_flush = OV.c_bind = OV.c_merged = OV.c_mixed = 0;
+    OV.c_inpass = OV.c_outside = OV.c_early = OV.c_order = 0;
 }
 
 // The scratch bytes of a uniform or storage binding [addr, addr+n) an overlay of this submission touches: 1 with *out
@@ -3433,7 +3508,8 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     if (ov_on()) {
         ov_sub(ex);
         OV.c_update++;
-        if (ex->in_pass && OV.n < OV_N && OV.np < OV_N && !ov_foreign_hits(u->dst, u->dst + u->size)) {
+        int here = ex->in_pass || ov_out_on();
+        if (here && OV.n < OV_N && OV.np < OV_N && !ov_foreign_hits(u->dst, u->dst + u->size)) {
             uint8_t *d = scratch(ex, u->size, &b, &o);
             memcpy(d, u->data, u->size);
             VK_MEM_PICK(sp);
@@ -3444,6 +3520,7 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
             note_written(ex, u->dst, u->size);
             upd_note(ex, u);
             OV.c_overlaid++;
+            if (!ex->in_pass) OV.c_overlaid_out++;
             return;
         }
         if (ex->in_pass) OV.c_inpass++;

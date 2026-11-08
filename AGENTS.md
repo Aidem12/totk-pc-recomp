@@ -1,34 +1,125 @@
-# TotK Recomp
+## Project Context
 
-Static recompilation of *Tears of the Kingdom* (Switch, ARM64) into a native Windows x86-64 exe with a Vulkan renderer. Design: [docs/architecture.md](docs/architecture.md). Toolchain, build commands and tests: [docs/building.md](docs/building.md).
+This repository is a fork of `valentderah/totk-pc-recomp`, focused on optimizing Linux/SteamOS performance for Steam Deck LCD.
 
-## Game content boundary
+Primary target:
+- Steam Deck LCD (AMD Aerith, Zen 2, RDNA 2).
+- Vulkan / RADV on SteamOS.
+- 8 W TDP efficiency target.
+- Reduce CPU overhead, memory operations, and frame-time spikes.
+- Preserve correctness and upstream compatibility.
 
-This repository is public. Game data lives outside it and every derived file stays in ignored folders.
+## Agent Behavior
 
-- The user's game and key paths are in `config.local.toml` (ignored). Pass the keys file path to tools; the tools read it themselves. Key values stay out of your output, logs, commands and files.
-- Everything extracted or generated goes under `build/` or `generated/`.
-- Every file the code generator emits carries the marker defined as `GENERATED_MARKER` in `tools/check_content.py`.
-- Run `python tools/check_content.py --staged` before proposing a commit. It is the same check CI runs.
+- Be concise, technical, and task-focused.
+- Avoid repeating information already established.
+- Prefer actions and results over lengthy explanations.
+- Do not provide generic tutorials unless requested.
+- Do not restate the entire task before starting.
+- Ask questions only when essential information is missing.
+- Complete the requested task without unrelated improvements.
+- Use existing project conventions.
 
-## Reusing code
+## Token Efficiency
 
-`refs/` holds the upstream checkouts (`tools/fetch_refs.sh` recreates it). Read-only.
+- Search for relevant symbols and functions before opening files.
+- Read only the necessary files and line ranges.
+- Prefer `rg`, `git diff`, and targeted searches.
+- Avoid dumping large files, logs, or directory listings.
+- Limit command output to relevant matches or summaries.
+- Reuse findings from the current session.
+- Do not repeatedly inspect unchanged files.
+- Avoid unnecessary documentation searches.
+- Summarize findings instead of copying large code sections.
+- Keep internal working notes short and factual.
+- Do not create additional reports unless requested.
 
-- Copy only MIT, BSD, ISC, zlib or Apache-2.0 code, keep its header, and add a row to `THIRD_PARTY_NOTICES.md`.
-- yuzu, suyu, OpenSmash-Ultimate and other GPL code: read for behaviour, write our own.
-- `tools/vendor/` stays byte-identical to upstream; Windows changes go in `tools/extract.py`.
+## Context Continuity
 
-## Code
+- Use `docs/agent-context.md` to preserve relevant task state.
+- Read it at the beginning of a new session when relevant.
+- Create it if missing and continuity tracking is needed.
+- Keep it under 400 words when practical.
+- Record only:
+  - Current objective and Git branch.
+  - Modified files.
+  - Important technical decisions.
+  - Implemented changes and verified results.
+  - Pending issues and next steps.
+- Update it after significant tasks, not every interaction.
+- Never store full conversations or lengthy reasoning.
+- Keep permanent instructions in `AGENTS.md`.
+- Keep temporary project state in `docs/agent-context.md`.
+- Avoid duplicating information across both files.
+- Before context compaction, preserve important progress.
+- Use context compaction only when necessary and supported.
+- Do not claim compaction occurred unless confirmed.
 
-- Build C with MSYS2 UCRT64 Clang (`C:\msys64\ucrt64\bin`). Generated C uses GNU extensions, so `cl.exe` is out. Call Ninja from that directory by full path or put it first on PATH.
-- Two Python environments: `.venv` (3.12) for the lifter and the build, `.venv-py314` for the extraction and shader scripts, which need `compression.zstd`.
-- Generated C is never edited by hand: change the generator (`recomp/`).
-- Every lifter change passes the differential tests against Unicorn ([docs/building.md](docs/building.md), "Checks"). After changing `recomp/jumptables.py`, `tests\jumptables_check.py` reports 0 disagreements on 1.2.1 and 1.4.3.
-- `recomp/layout.py` alone decides module bases.
-- Graphics bugs: [docs/maxwell.md](docs/maxwell.md) lists the Maxwell behaviour the Vulkan path must match and the TotK bugs other ports fixed.
-- Comments say what the code does and why, in words that stand on their own. Cite our code by file plus function (a line number may follow as a hint) and upstream code by project, file and function: `refs/` moves, so its line numbers rot. Commit hashes belong to the attribution of copied code.
+## Code Changes
 
-## Writing
+- Make the smallest correct change.
+- Preserve existing behavior unless explicitly requested.
+- Avoid unrelated refactoring and formatting changes.
+- Do not introduce dependencies without justification.
+- Reuse existing helpers when appropriate.
+- Do not optimize code without identifying the actual overhead.
+- Preserve Vulkan synchronization, resource lifetimes, and memory coherence.
+- Prioritize correctness over speculative performance gains.
 
-Code, comments, docs and commit messages are in English. Commit messages are plain sentences without type prefixes.
+## Performance Optimization
+
+- Focus on measured CPU/runtime bottlenecks.
+- Consider Steam Deck's shared CPU/GPU power budget.
+- Avoid assuming discrete GPU behavior applies to UMA.
+- Avoid unnecessary allocations, repeated scans, and redundant work.
+- Do not assume an optimization improves FPS without benchmarks.
+- Separate measured gains from theoretical improvements.
+- Keep CPU/GPU work ordering and synchronization correct.
+- Prefer reversible, isolated optimizations.
+
+## Testing
+
+- Run focused tests related to changed code first.
+- Expand test coverage only when necessary.
+- Do not rebuild the entire project for documentation-only changes.
+- Prefer incremental builds when possible.
+- Report failed checks and relevant warnings concisely.
+- Never claim tests passed unless executed.
+- Do not suppress errors to make tests pass.
+- Do not modify unrelated code to fix pre-existing failures.
+
+## Git Safety
+
+- Check the current branch and working tree before editing.
+- Preserve existing uncommitted changes.
+- Never run destructive Git commands without approval.
+- Do not commit, push, merge, rebase, or create releases unless requested.
+- Never modify the upstream repository directly.
+- Follow Conventional Commits when commits are requested.
+- Do not include generated game data or copyrighted assets.
+
+## Build Safety
+
+- Reuse existing toolchains, dependencies, and build artifacts.
+- Avoid unnecessary full rebuilds.
+- Use isolated build directories for experiments.
+- Preserve existing releases and working builds.
+- Do not delete caches unless explicitly required.
+- Never assume a successful runtime build means the full game is validated.
+
+## Response Format
+
+Use short responses with:
+
+1. Result or finding.
+2. Files changed, if applicable.
+3. Tests executed and their results.
+4. Remaining issues or next step.
+
+Avoid long introductions, repeated summaries, and unnecessary suggestions.
+
+## Priority
+
+Correctness > Safety > Minimal Changes > Performance > Token Efficiency
+
+When additional investigation is necessary for correctness, perform it rather than sacrificing quality to save tokens.

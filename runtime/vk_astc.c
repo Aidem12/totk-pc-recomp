@@ -463,13 +463,9 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     cap_in = (cap_in + al - 1) / al * al;
     cap_out = (cap_out + al - 1) / al * al;
     if (!bc) cap_bc = 0;
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = cap_in + cap_out + cap_bc,
-                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     VkBuffer sb;
     VmaAllocation sa;
-    if (vmaCreateBuffer(c->vma, &bi, &aci, &sb, &sa, NULL) != VK_SUCCESS) {
+    if (vk_scratch_buffer(cap_in + cap_out + cap_bc, &sb, &sa) != VK_SUCCESS) {
         if (plat_inc32(&n_fail) <= 16)
             rt_log("vk: ASTC scratch buffer of %llu bytes failed: texture left undecoded",
                    (unsigned long long)(cap_in + cap_out));
@@ -509,9 +505,14 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
         w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)i,
                                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                       .pBufferInfo = &dbi[i]};
-    VkBufferImageCopy *copies = calloc((size_t)n, sizeof *copies);
-    VkBufferCopy *bcp = calloc((size_t)n, sizeof *bcp);
+    enum { LOCAL_REGIONS = 16 };
+    VkBufferImageCopy local_copies[LOCAL_REGIONS];
+    VkBufferCopy local_bcp[LOCAL_REGIONS];
+    VkBufferImageCopy *copies = n <= LOCAL_REGIONS ? local_copies : calloc((size_t)n, sizeof *copies);
+    VkBufferCopy *bcp = n <= LOCAL_REGIONS ? local_bcp : calloc((size_t)n, sizeof *bcp);
     if (!copies || !bcp) rt_fatal("vk: out of memory (ASTC regions)");
+    if (copies == local_copies) memset(copies, 0, (size_t)n * sizeof *copies);
+    if (bcp == local_bcp) memset(bcp, 0, (size_t)n * sizeof *bcp);
     VkDeviceSize rb_off = 0;
     int chunks = 0;
     for (int i0 = 0; i0 < n; chunks++) {
@@ -606,7 +607,8 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
         vk_astc_time_summary();
     }
     n_dispatch += (uint64_t)n;
-    free(copies), free(bcp);
+    if (copies != local_copies) free(copies);
+    if (bcp != local_bcp) free(bcp);
     vk_defer_buffer(sb, sa);
     return 1;
 }

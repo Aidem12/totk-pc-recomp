@@ -63,6 +63,9 @@ def main(argv=None):
     ap.add_argument('--verify', action='store_true', help='hash every kept file, also those this release made')
     ap.add_argument('--dlss', action='store_true', help="download NVIDIA's nvngx_dlss.dll (NVIDIA RTX SDK license) next "
                                                       'to the game, for dlaa and the DLSS modes')
+    ap.add_argument('--prepare-profile', choices=('general', 'steam-deck'),
+                    help='patch outputs: general (all aspects) or steam-deck (16:9 and 1280x800); '
+                         'omitted: keep the saved profile, or general for a new installation')
     args = ap.parse_args(argv)
 
     # The window cancels with Ctrl+Break to the installer's process group (CREATE_NEW_PROCESS_GROUP), which also reaches
