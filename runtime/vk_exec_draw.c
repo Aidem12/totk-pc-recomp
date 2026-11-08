@@ -3119,12 +3119,13 @@ static void op_draw(VkExec *ex, const p_draw *d) {
         ex->recorded++;
         vkCmdDrawIndexed(ex->cb, 6 * q, inst, 0, 0, (uint32_t)d->base_instance);
     } else if (d->prim == NVN_DRAW_PRIMITIVE_LINE_LOOP && n >= 2) {   // a strip that returns to its first vertex
-        uint32_t *ix = malloc(sizeof *ix * (n + 1));
-        if (!ix) rt_fatal("vk: out of memory");
+        VkBuffer ib;
+        VkDeviceSize io;
+        uint32_t *ix = (uint32_t *)scratch(ex, sizeof *ix * ((uint64_t)n + 1), &ib, &io);
         for (uint32_t i = 0; i < n; i++) ix[i] = first + i;
         ix[n] = first;
-        bind_index(ex, ix, sizeof *ix * (n + 1), VK_INDEX_TYPE_UINT32);
-        free(ix);
+        vkCmdBindIndexBuffer(ex->cb, ib, io, VK_INDEX_TYPE_UINT32);
+        ex->recorded++;
         vkCmdDrawIndexed(ex->cb, n + 1, inst, 0, 0, (uint32_t)d->base_instance);
     } else {
         vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance);
