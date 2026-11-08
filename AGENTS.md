@@ -34,6 +34,27 @@ Primary target:
 - Keep internal working notes short and factual.
 - Do not create additional reports unless requested.
 
+## Context Continuity
+
+- Use `docs/agent-context.md` to preserve relevant task state.
+- Read it at the beginning of a new session when relevant.
+- Create it if missing and continuity tracking is needed.
+- Keep it under 400 words when practical.
+- Record only:
+  - Current objective and Git branch.
+  - Modified files.
+  - Important technical decisions.
+  - Implemented changes and verified results.
+  - Pending issues and next steps.
+- Update it after significant tasks, not every interaction.
+- Never store full conversations or lengthy reasoning.
+- Keep permanent instructions in `AGENTS.md`.
+- Keep temporary project state in `docs/agent-context.md`.
+- Avoid duplicating information across both files.
+- Before context compaction, preserve important progress.
+- Use context compaction only when necessary and supported.
+- Do not claim compaction occurred unless confirmed.
+
 ## Code Changes
 
 - Make the smallest correct change.
