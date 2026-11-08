@@ -3389,15 +3389,23 @@ void vk_exec_ub_flush(VkExec *ex) {
                            .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT};
     VkDependencyInfo wdi = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &ww};
     uint32_t since = 0;   // the first copy recorded after the last barrier
+    uint64_t lo = UINT64_MAX, hi = 0;
     for (uint32_t i = 0; i < OV.np; i++) {
-        for (uint32_t k = since; k < i; k++)
-            if (OV.p[i].dst < OV.p[k].dst + OV.p[k].size && OV.p[k].dst < OV.p[i].dst + OV.p[i].size) {
-                vkCmdPipelineBarrier2(ex->cb, &wdi);
-                ex->recorded++;
-                OV.c_order++;
-                since = i;
-                break;
-            }
+        uint64_t dst = OV.p[i].dst, end = dst + OV.p[i].size;
+        // A disjoint bounding interval cannot overlap any copy since the last barrier.
+        if (dst < hi && lo < end) {
+            for (uint32_t k = since; k < i; k++)
+                if (OV.p[i].dst < OV.p[k].dst + OV.p[k].size && OV.p[k].dst < OV.p[i].dst + OV.p[i].size) {
+                    vkCmdPipelineBarrier2(ex->cb, &wdi);
+                    ex->recorded++;
+                    OV.c_order++;
+                    since = i;
+                    lo = UINT64_MAX, hi = 0;
+                    break;
+                }
+        }
+        if (dst < lo) lo = dst;
+        if (end > hi) hi = end;
         VkBufferCopy cp = {OV.p[i].soff, OV.p[i].sp.offset, OV.p[i].size};
         vkCmdCopyBuffer(ex->cb, OV.p[i].src, OV.p[i].sp.buffer, 1, &cp);
         ex->recorded++;
