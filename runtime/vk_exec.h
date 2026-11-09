@@ -98,6 +98,7 @@ typedef struct VkExec {
     // ---- internal to vk_exec.c
     void *views;                         // image views created for this command buffer (freed at its fence)
     int nviews, cap_views;
+    int last_view;                       // index in views; valid only when nviews > 0
     int barrier_at;                      // recorded right after the last full barrier (-1: none yet)
 
     // Feedback loops (vk.h VkCtx.feedback, vk_exec_draw.c feedback_prepare). Learned targets are attached in

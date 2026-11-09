@@ -204,7 +204,7 @@ static uint64_t ov_at(const VkExec *ex, uint64_t addr, uint64_t n) {
 #define RS_PTRS 4
 typedef struct { uint32_t off, len; } RsRange;
 typedef struct { int st; const GfxShaderRes *res; } RsPtr;
-typedef struct { uint32_t n, bytes; uint8_t sup, c0, ok, np; RsPtr p[RS_PTRS]; RsRange r[]; } RsList;
+typedef struct { uint32_t n, bytes, nov; uint8_t sup, c0, ok, np; RsPtr p[RS_PTRS]; RsRange r[]; } RsList;
 static nvn_hmap rs_lists;                // VkPipeInfo pointer -> RsList, until shutdown
 static const VkPipeInfo *rs_last;        // the last lookup
 static const RsList *rs_last_l;
@@ -1733,12 +1733,28 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
         uint64_t bytes = 0;
         for (uint32_t i = 0; i < n; i++) bytes += tmp[i].len;
         if (bytes > RS_BYTES) ok = 0;
-        l = malloc(sizeof *l + sizeof *tmp * n);
+        // Each selected offset consumes a complete p_bind_buf in the ranges. Keep only immutable metadata;
+        // the binding values and overlay serials are still read on every draw, in their original order.
+        size_t offset_cap = (size_t)(bytes / sizeof(p_bind_buf));
+        l = malloc(sizeof *l + sizeof *tmp * n + offset_cap * sizeof(uint32_t));
         if (!l) rt_fatal("vk: out of memory");
         l->n = n, l->bytes = (uint32_t)bytes, l->sup = (uint8_t)sup, l->c0 = (uint8_t)c0, l->ok = (uint8_t)ok;
         l->np = (uint8_t)np;
         memcpy(l->p, ptr, sizeof *ptr * np);
         memcpy(l->r, tmp, sizeof *tmp * n);
+        l->nov = 0;
+        uint32_t *offsets = (uint32_t *)(l->r + l->n);
+        const size_t lo = offsetof(VkExec, ubo), hi = offsetof(VkExec, ssbo) + sizeof ex->ssbo;
+        for (uint32_t i = 0; i < l->n; i++) {
+            const RsRange *r = &l->r[i];
+            if (r->off + r->len <= lo || r->off >= hi) continue;
+            for (uint32_t o = 0; o + sizeof(p_bind_buf) <= r->len; o += sizeof(p_bind_buf)) {
+                size_t at = r->off + o;
+                if (at < lo || at + sizeof(p_bind_buf) > hi) continue;
+                if ((at < offsetof(VkExec, ssbo) ? at - lo : at - offsetof(VkExec, ssbo)) % sizeof(p_bind_buf)) continue;
+                offsets[l->nov++] = (uint32_t)at;
+            }
+        }
         nvn_hm_put(&rs_lists, &info, l);
     }
     rs_last = info, rs_last_l = l;
@@ -1778,17 +1794,10 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
     // other bytes after each update, every other draw is left to skip
     if (OV.n) {
         uint64_t ov = 0;
-        const size_t lo = offsetof(VkExec, ubo), hi = offsetof(VkExec, ssbo) + sizeof ex->ssbo;
-        for (uint32_t i = 0; i < l->n; i++) {
-            const RsRange *r = &l->r[i];
-            if (r->off + r->len <= lo || r->off >= hi) continue;
-            for (uint32_t o = 0; o + sizeof(p_bind_buf) <= r->len; o += sizeof(p_bind_buf)) {
-                size_t at = r->off + o;
-                if (at < lo || at + sizeof(p_bind_buf) > hi) continue;
-                if ((at < offsetof(VkExec, ssbo) ? at - lo : at - offsetof(VkExec, ssbo)) % sizeof(p_bind_buf)) continue;
-                const p_bind_buf *b = (const p_bind_buf *)((const uint8_t *)ex + at);
-                if (b->addr) ov = ov * 1099511628211ull ^ ov_at(ex, b->addr, b->size ? b->size : ov_rest(b->addr));
-            }
+        const uint32_t *offsets = (const uint32_t *)(l->r + l->n);
+        for (uint32_t i = 0; i < l->nov; i++) {
+            const p_bind_buf *b = (const p_bind_buf *)((const uint8_t *)ex + offsets[i]);
+            if (b->addr) ov = ov * 1099511628211ull ^ ov_at(ex, b->addr, b->size ? b->size : ov_rest(b->addr));
         }
         for (int i = 0; i < l->np; i++) {   // storage read through an address in a uniform block: no size either
             uint64_t a = stable[i] ? ptr[i] : ubo_ptr(ex, l->p[i].st, l->p[i].res, NULL);

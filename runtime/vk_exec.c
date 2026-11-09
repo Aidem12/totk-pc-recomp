@@ -39,6 +39,7 @@ typedef struct {
     VkImageAspectFlags aspect;
     uint32_t level, base, layers;
     VkImageView view;
+    int blocks;
 } ViewEnt;
 
 static VkExec X;
@@ -428,16 +429,25 @@ static void resolve_rt(VkExec *ex) {
     ex->pipe.samples = (uint8_t)ex->pass_samples;
 }
 
+static int view_matches(const ViewEnt *v, const VkExecTarget *t) {
+    return v->image == t->image && v->format == t->format && v->type == t->view_type && v->aspect == t->aspect &&
+           v->level == t->level && v->base == t->base_layer && v->layers == t->layers;
+}
+
 // The attachment view of a target. A registered texture's view lives as long as its image (vk_exec_target_view); any
 // other image's view is made for this command buffer and freed at its fence.
 static VkImageView view_of(VkExec *ex, const VkExecTarget *t) {
     if (t->img && t->img->image == t->image)
         return vk_exec_target_view(t->img, t->format, t->view_type, t->aspect, t->level, t->base_layer, t->layers, t->blocks);
     ViewEnt *v = ex->views;
+    // Index rather than pointer: growing views may move the allocation. nviews scopes this to the submission.
+    if (ex->nviews && v[ex->last_view].blocks == !!t->blocks && view_matches(&v[ex->last_view], t)) return v[ex->last_view].view;
+    // Keep the existing fallback identity; blocks additionally gates the fast path because it selects pNext.
     for (int i = 0; i < ex->nviews; i++)
-        if (v[i].image == t->image && v[i].format == t->format && v[i].type == t->view_type && v[i].aspect == t->aspect &&
-            v[i].level == t->level && v[i].base == t->base_layer && v[i].layers == t->layers)
+        if (view_matches(&v[i], t)) {
+            ex->last_view = i;
             return v[i].view;
+        }
     VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->image,
                                 .viewType = t->view_type, .format = t->format,
                                 .subresourceRange = {t->aspect, t->level, 1, t->base_layer, t->layers}};
@@ -453,7 +463,8 @@ static VkImageView view_of(VkExec *ex, const VkExecTarget *t) {
         if (!ex->views) rt_fatal("vk: out of memory");
         v = ex->views;
     }
-    v[ex->nviews++] = (ViewEnt){t->image, t->format, t->view_type, t->aspect, t->level, t->base_layer, t->layers, view};
+    ex->last_view = ex->nviews;
+    v[ex->nviews++] = (ViewEnt){t->image, t->format, t->view_type, t->aspect, t->level, t->base_layer, t->layers, view, !!t->blocks};
     return view;
 }
 
@@ -947,7 +958,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     ex->mark_passes = ex->mark_dispatches = 0;
     ex->dirty = VK_EXEC_DIRTY_ALL;
     ex->rt_resolved = 0;   // images may have changed since the last command buffer
-    ex->nviews = 0;
+    ex->nviews = 0, ex->last_view = 0;
     ex->barrier_at = -1;
     ex->nfbl = 0;   // the previous command buffer ended with a full barrier: every image is in GENERAL
     vk_exec_frame.submits++;
@@ -969,7 +980,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
         l->n = ex->nviews;
         for (int i = 0; i < ex->nviews; i++) l->v[i] = ((ViewEnt *)ex->views)[i].view;
         vk_completion_add(fence, free_views, l);
-        ex->nviews = 0;
+        ex->nviews = 0, ex->last_view = 0;
     }
     ex->cb = VK_NULL_HANDLE;
     if (n) n_subs++;
