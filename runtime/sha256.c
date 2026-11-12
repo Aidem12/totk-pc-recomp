@@ -7,6 +7,7 @@
 
 #if defined(__x86_64__)
 #include <immintrin.h>
+#include <cpuid.h>
 #endif
 
 static const uint32_t K[64] = {
@@ -78,7 +79,12 @@ __attribute__((target("sha,sse4.1"))) static void blocks_ni(uint32_t h[8], const
 static void blocks(uint32_t h[8], const uint8_t *p, size_t n) {
 #if defined(__x86_64__)
     static int ni = -1;
-    if (ni < 0) ni = __builtin_cpu_supports("sha") && __builtin_cpu_supports("sse4.1");
+    if (ni < 0) {
+        unsigned int eax, ebx, ecx, edx;
+        ni = __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)
+             && (ebx & (1u << 29))
+             && __builtin_cpu_supports("sse4.1");
+    }
     if (ni) return blocks_ni(h, p, n);
 #endif
     blocks_c(h, p, n);

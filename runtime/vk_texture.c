@@ -910,8 +910,11 @@ static void upload_cpu(Tex *e) {
     int astc = e->f.astc_bw != 0, rgb = e->f.expand_rgb;
     int agpu = astc && vk_astc_gpu(), acheck = agpu && vk_astc_mode() == VK_ASTC_CHECK;   // raw blocks to the GPU
     uint32_t n = levels * layers, k = 0;
-    VkBufferImageCopy *rg = calloc(n, sizeof *rg);
-    VkAstcRegion *ar = agpu ? calloc(n, sizeof *ar) : NULL;
+    VkBufferImageCopy rg_local[16] = {0};
+    VkAstcRegion ar_local[16] = {0};
+    VkBufferImageCopy *rg = n <= 16 ? rg_local : calloc(n, sizeof *rg);
+    VkAstcRegion *ar = agpu ? (n <= 16 ? ar_local : calloc(n, sizeof *ar)) : NULL;
+    if (!rg || (agpu && !ar)) rt_fatal("vk: out of memory (upload regions)");
     VkDeviceSize total = 0, decoded = 0;
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
@@ -1000,8 +1003,8 @@ static void upload_cpu(Tex *e) {
         vmaDestroyBuffer(vk_ctx()->vma, rbuf, ralloc);
     }
     free(raw_copy);
-    free(ar);
-    free(rg);
+    if (ar != ar_local) free(ar);
+    if (rg != rg_local) free(rg);
 }
 
 // Block-linear storage in an imported pool, deswizzled by the GPU (vk_deswizzle.c): the replay thread only records
@@ -2112,13 +2115,27 @@ static void write_back_n(Tex **v, int n) {
 }
 
 // Mirrored textures overlapping [addr, addr+size) that the GPU wrote since their last write-back.
-static int owned_dirty(uint64_t addr, uint64_t size, Tex **hit) {
+typedef struct { Tex *local[16]; Tex **p; int n; } WbHits;
+
+// Called while ownership cannot change. At most nowned distinct entries are collected.
+static void wb_hit_add(WbHits *h, Tex *e) {
+    if (h->n == 16) {
+        Tex **p = malloc(sizeof *p * (size_t)nowned);
+        if (!p) rt_fatal("vk: out of memory for a texture write-back");
+        memcpy(p, h->local, sizeof h->local);
+        h->p = p;
+    }
+    h->p[h->n++] = e;
+}
+
+static int owned_dirty(uint64_t addr, uint64_t size, WbHits *hit) {
     int n = 0;
     for (int i = owned_lower(addr > max_owned ? addr - max_owned : 0); i < nowned && owned[i]->pub.addr < addr + size; i++) {
         Tex *e = owned[i];
         if (__atomic_load_n(&e->gpu_dirty, __ATOMIC_RELAXED) && e->pub.addr + e->t.L.size > addr) {
             if (!hit) return 1;
-            hit[n++] = e;
+            wb_hit_add(hit, e);
+            n++;
         }
     }
     return n;
@@ -2176,9 +2193,9 @@ uint64_t vk_texture_dirty_fence(uint64_t addr, uint64_t size) {
 // first, so where two descriptors share storage the newer render wins.
 void vk_texture_write_back(uint64_t addr, uint64_t size) {
     lock();
-    Tex **hit = malloc(sizeof *hit * (size_t)(nowned + 1));
-    if (!hit) rt_fatal("vk: out of memory for a texture write-back");
-    int n = owned_dirty(addr, size, hit), k = 0;   // owned[] cannot change while tex_lock is held
+    WbHits hits = {.p = hits.local};
+    int n = owned_dirty(addr, size, &hits), k = 0;
+    Tex **hit = hits.p;
     for (int i = 0; i < n; i++) {
         uint32_t now;
         if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;
@@ -2192,7 +2209,7 @@ void vk_texture_write_back(uint64_t addr, uint64_t size) {
     write_back_n(hit, k);
     for (int i = 0; i < k; i++) perf_count(PERF_CNT_WB);
     for (int i = k; i < n; i++) perf_count(PERF_CNT_WB_SKIP);
-    free(hit);
+    if (hit != hits.local) free(hit);
     unlock();
 }
 
@@ -2228,11 +2245,8 @@ void vk_texture_write_back_small(uint64_t fence) {
     wb_cfg_init();
     __atomic_store_n(&small_pending, 0, __ATOMIC_RELAXED);
     plat_mutex_lock_shared(&owned_lock);
-    int n = 0, later = 0;
-    for (int i = 0; i < nowned; i++) n += owned[i]->gpu_dirty && wb_wanted(owned[i]);
-    Tex **hit = n ? malloc(sizeof *hit * (size_t)n) : NULL;
-    if (n && !hit) rt_fatal("vk: out of memory for a texture write-back");
-    n = 0;
+    WbHits hits = {.p = hits.local};
+    int later = 0;
     for (int i = 0; i < nowned; i++) {
         Tex *e = owned[i];
         if (!e->gpu_dirty) continue;
@@ -2246,9 +2260,11 @@ void vk_texture_write_back_small(uint64_t fence) {
         if (e->gpu_fence > fence) later = 1;
         else {
             if (wb_trace && e->t.L.size > WB_SMALL_DEFAULT) wb_note(e, 0);
-            hit[n++] = e;
+            wb_hit_add(&hits, e);
         }
     }
+    int n = hits.n;
+    Tex **hit = hits.p;
     plat_mutex_unlock_shared(&owned_lock);
     if (later) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
     int k = 0;
@@ -2265,7 +2281,7 @@ void vk_texture_write_back_small(uint64_t fence) {
     write_back_n(hit, k);
     for (int i = 0; i < k; i++) perf_count(PERF_CNT_WB);
     for (int i = k; i < n; i++) perf_count(PERF_CNT_WB_SKIP);
-    free(hit);
+    if (hit != hits.local) free(hit);
     unlock();
 }
 

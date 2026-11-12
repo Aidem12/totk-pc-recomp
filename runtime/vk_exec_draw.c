@@ -200,7 +200,7 @@ static uint64_t ov_at(const VkExec *ex, uint64_t addr, uint64_t n) {
 #define RS_PTRS 4
 typedef struct { uint32_t off, len; } RsRange;
 typedef struct { int st; const GfxShaderRes *res; } RsPtr;
-typedef struct { uint32_t n, bytes; uint8_t sup, c0, ok, np; RsPtr p[RS_PTRS]; RsRange r[]; } RsList;
+typedef struct { uint32_t n, bytes, nov; uint8_t sup, c0, ok, np; RsPtr p[RS_PTRS]; RsRange r[]; } RsList;
 // (program, stage, answers) -> shader, 4-way set-associative, most recently used first. A miss costs a SHA-256 of the
 // whole shader code (gfx_shader.c req_init), slow on CPUs without SHA instructions: a field frame looks up ~3000 and
 // the 2048-slot direct-mapped table this replaced missed 3% of them on conflicts.
@@ -431,6 +431,7 @@ static void ub_written(VkExec *ex, uint64_t addr, uint64_t n);
 
 static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
     CbRes *r = cb_res(ex);
+    if (r->nwritten && r->written[r->nwritten - 1].addr == addr && r->written[r->nwritten - 1].size == size) return;
     for (int i = 0; i < r->nwritten; i++)
         if (r->written[i].addr == addr && r->written[i].size == size) return;
     if (r->nwritten == r->cwritten) r->written = grow(r->written, &r->cwritten, sizeof *r->written);
@@ -1248,11 +1249,13 @@ static void upd_apply(const VkExec *ex, uint64_t a, uint8_t *out, size_t n) {
 
 // That address as the bound block holds it at this point of the replay; 0 when the block is unbound or too short. The
 // block has no size field.
-static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
+static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r, int *stable) {
     const p_bind_buf *u = &ex->ubo[st][r->cbuf_slot - 3];
     uint64_t off = (uint64_t)r->handle * 4, a = 0;
     VkMemSpan sp;
+    if (stable) *stable = 1;
     if (!u->addr || u->size < off + 8 || upd_read(ex, u->addr + off, &a, 8)) return a;
+    if (stable) *stable = 0;
     if (vk_mem_resolve(u->addr + off, 8, &sp)) memcpy(&a, (const void *)(uintptr_t)(u->addr + off), 8);
     return a;
 }
@@ -1264,7 +1267,7 @@ static const p_bind_buf *ssbo_bound(const VkExec *ex, int st, const GfxShaderRes
     int slot = ssbo_slot(r, st, ubo);
     if (slot >= 0 && slot < 16) return *ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
     if (!ubo_ptr_res(r)) return NULL;
-    up->addr = ubo_ptr(ex, st, r);
+    up->addr = ubo_ptr(ex, st, r, NULL);
     return up;
 }
 
@@ -1973,12 +1976,27 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
         uint64_t bytes = 0;
         for (uint32_t i = 0; i < n; i++) bytes += tmp[i].len;
         if (bytes > RS_BYTES) ok = 0;
-        l = malloc(sizeof *l + sizeof *tmp * n);
+        // Immutable offsets only; mutable binding values are read on every draw.
+        size_t cap = (size_t)(bytes / sizeof(p_bind_buf));
+        l = malloc(sizeof *l + sizeof *tmp * n + cap * sizeof(uint32_t));
         if (!l) rt_fatal("vk: out of memory");
         l->n = n, l->bytes = (uint32_t)bytes, l->sup = (uint8_t)sup, l->c0 = (uint8_t)c0, l->ok = (uint8_t)ok;
         l->np = (uint8_t)np;
         memcpy(l->p, ptr, sizeof *ptr * np);
         memcpy(l->r, tmp, sizeof *tmp * n);
+        l->nov = 0;
+        uint32_t *offsets = (uint32_t *)(l->r + l->n);
+        const size_t lo = offsetof(VkExec, ubo), hi = offsetof(VkExec, ssbo) + sizeof ex->ssbo;
+        for (uint32_t i = 0; i < l->n; i++) {
+            const RsRange *r = &l->r[i];
+            if (r->off + r->len <= lo || r->off >= hi) continue;
+            for (uint32_t o = 0; o + sizeof(p_bind_buf) <= r->len; o += sizeof(p_bind_buf)) {
+                size_t at = r->off + o;
+                if (at < lo || at + sizeof(p_bind_buf) > hi) continue;
+                if ((at < offsetof(VkExec, ssbo) ? at - lo : at - offsetof(VkExec, ssbo)) % sizeof(p_bind_buf)) continue;
+                offsets[l->nov++] = (uint32_t)at;
+            }
+        }
         nvn_hm_put(&D->rs_lists, &info, l);
     }
     D->rs_last = info, D->rs_last_l = l;
@@ -2013,25 +2031,20 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
         PUT(ps);
     }
     if (l->c0) PUT(D->c0_binst);
-    for (int i = 0; i < l->np; i++) PUT(ubo_ptr(ex, l->p[i].st, l->p[i].res));
+    uint64_t ptr[RS_PTRS];
+    int stable[RS_PTRS];
+    for (int i = 0; i < l->np; i++) PUT(ptr[i] = ubo_ptr(ex, l->p[i].st, l->p[i].res, &stable[i]));
     // The uniform overlays the draw's uniform and storage bindings read (op_update_ub): a draw of an updated block binds
     // other bytes after each update, every other draw is left to skip
     if (OV.n) {
         uint64_t ov = 0;
-        const size_t lo = offsetof(VkExec, ubo), hi = offsetof(VkExec, ssbo) + sizeof ex->ssbo;
-        for (uint32_t i = 0; i < l->n; i++) {
-            const RsRange *r = &l->r[i];
-            if (r->off + r->len <= lo || r->off >= hi) continue;
-            for (uint32_t o = 0; o + sizeof(p_bind_buf) <= r->len; o += sizeof(p_bind_buf)) {
-                size_t at = r->off + o;
-                if (at < lo || at + sizeof(p_bind_buf) > hi) continue;
-                if ((at < offsetof(VkExec, ssbo) ? at - lo : at - offsetof(VkExec, ssbo)) % sizeof(p_bind_buf)) continue;
-                const p_bind_buf *b = (const p_bind_buf *)((const uint8_t *)ex + at);
-                if (b->addr) ov = ov * 1099511628211ull ^ ov_at(ex, b->addr, b->size ? b->size : ov_rest(b->addr));
-            }
+        const uint32_t *offsets = (const uint32_t *)(l->r + l->n);
+        for (uint32_t i = 0; i < l->nov; i++) {
+            const p_bind_buf *b = (const p_bind_buf *)((const uint8_t *)ex + offsets[i]);
+            if (b->addr) ov = ov * 1099511628211ull ^ ov_at(ex, b->addr, b->size ? b->size : ov_rest(b->addr));
         }
         for (int i = 0; i < l->np; i++) {   // storage read through an address in a uniform block: no size either
-            uint64_t a = ubo_ptr(ex, l->p[i].st, l->p[i].res);
+            uint64_t a = stable[i] ? ptr[i] : ubo_ptr(ex, l->p[i].st, l->p[i].res, NULL);
             if (a) ov = ov * 1099511628211ull ^ ov_at(ex, a, ov_rest(a));
         }
         PUT(ov);
@@ -3369,14 +3382,6 @@ int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth
     return 1;
 }
 
-static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType type) {
-    VkBuffer b;
-    VkDeviceSize o;
-    memcpy(scratch(ex, bytes, &b, &o), data, bytes);
-    vkCmdBindIndexBuffer(ex->cb, b, o, type);
-    ex->recorded++;
-}
-
 static void op_draw(VkExec *ex, const p_draw *d) {
     VkExecDraw *D = ex->draw;
     D->c0_binst = (uint32_t)d->base_instance;
@@ -3385,22 +3390,24 @@ static void op_draw(VkExec *ex, const p_draw *d) {
     uint32_t inst = d->instances > 0 ? (uint32_t)d->instances : 1, first = (uint32_t)d->first, n = (uint32_t)d->count;
     if (d->prim == NVN_DRAW_PRIMITIVE_QUADS && n >= 4) {   // quads become two triangles each
         uint32_t q = n / 4;
-        uint32_t *ix = malloc(sizeof *ix * 6 * q);
-        if (!ix) rt_fatal("vk: out of memory");
+        VkBuffer ib;
+        VkDeviceSize io;
+        uint32_t *ix = (uint32_t *)scratch(ex, sizeof *ix * (6 * (uint64_t)q), &ib, &io);
         for (uint32_t i = 0; i < q; i++) {
             uint32_t v = first + 4 * i, k[6] = {0, 1, 2, 0, 2, 3};
             for (int j = 0; j < 6; j++) ix[6 * i + j] = v + k[j];
         }
-        bind_index(ex, ix, sizeof *ix * 6 * q, VK_INDEX_TYPE_UINT32);
-        free(ix);
+        vkCmdBindIndexBuffer(ex->cb, ib, io, VK_INDEX_TYPE_UINT32);
+        ex->recorded++;
         vkCmdDrawIndexed(ex->cb, 6 * q, inst, 0, 0, (uint32_t)d->base_instance);
     } else if (d->prim == NVN_DRAW_PRIMITIVE_LINE_LOOP && n >= 2) {   // a strip that returns to its first vertex
-        uint32_t *ix = malloc(sizeof *ix * (n + 1));
-        if (!ix) rt_fatal("vk: out of memory");
+        VkBuffer ib;
+        VkDeviceSize io;
+        uint32_t *ix = (uint32_t *)scratch(ex, sizeof *ix * ((uint64_t)n + 1), &ib, &io);
         for (uint32_t i = 0; i < n; i++) ix[i] = first + i;
         ix[n] = first;
-        bind_index(ex, ix, sizeof *ix * (n + 1), VK_INDEX_TYPE_UINT32);
-        free(ix);
+        vkCmdBindIndexBuffer(ex->cb, ib, io, VK_INDEX_TYPE_UINT32);
+        ex->recorded++;
         vkCmdDrawIndexed(ex->cb, n + 1, inst, 0, 0, (uint32_t)d->base_instance);
     } else {
         vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance);
@@ -3442,14 +3449,15 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
         if (sp.alloc) return warn_once(W_INDEX, "byte indices in device-local memory: draw skipped");
         vk_mem_count(sp.cls, VK_MUSE_CPU_READ, bytes);
         vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_IB, 2 * bytes);
-        uint16_t *ix = malloc(sizeof *ix * (size_t)d->count);
-        if (!ix) rt_fatal("vk: out of memory");
+        VkBuffer ib;
+        VkDeviceSize io;
+        uint16_t *ix = (uint16_t *)scratch(ex, sizeof *ix * ((uint64_t)d->count), &ib, &io);
         for (int i = 0; i < d->count; i++) {
             uint8_t v = ((const uint8_t *)(uintptr_t)d->ibuf)[i];
             ix[i] = restart && v == 0xff ? 0xffff : v;
         }
-        bind_index(ex, ix, sizeof *ix * (size_t)d->count, VK_INDEX_TYPE_UINT16);
-        free(ix);
+        vkCmdBindIndexBuffer(ex->cb, ib, io, VK_INDEX_TYPE_UINT16);
+        ex->recorded++;
     } else if (sp.offset % isize[d->itype]) {
         return warn_once(W_INDEX, "index buffer %#llx is not aligned to its index size: draw skipped", (unsigned long long)d->ibuf);
     } else {
@@ -3677,16 +3685,23 @@ void vk_exec_ub_flush(VkExec *ex) {
                            .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
                            .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT};
     VkDependencyInfo wdi = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &ww};
+    uint64_t batch_lo = UINT64_MAX, batch_hi = 0;
     uint32_t since = 0;   // the first copy recorded after the last barrier
     for (uint32_t i = 0; i < OV.np; i++) {
-        for (uint32_t k = since; k < i; k++)
-            if (OV.p[i].dst < OV.p[k].dst + OV.p[k].size && OV.p[k].dst < OV.p[i].dst + OV.p[i].size) {
-                vkCmdPipelineBarrier2(ex->cb, &wdi);
-                ex->recorded++;
-                OV.c_order++;
-                since = i;
-                break;
-            }
+        uint64_t end = OV.p[i].dst + OV.p[i].size;
+        if (OV.p[i].dst < batch_hi && end > batch_lo) {
+            for (uint32_t k = since; k < i; k++)
+                if (OV.p[i].dst < OV.p[k].dst + OV.p[k].size && OV.p[k].dst < OV.p[i].dst + OV.p[i].size) {
+                    vkCmdPipelineBarrier2(ex->cb, &wdi);
+                    ex->recorded++;
+                    OV.c_order++;
+                    since = i;
+                    batch_lo = UINT64_MAX, batch_hi = 0;
+                    break;
+                }
+        }
+        if (OV.p[i].dst < batch_lo) batch_lo = OV.p[i].dst;
+        if (end > batch_hi) batch_hi = end;
         VkBufferCopy cp = {OV.p[i].soff, OV.p[i].sp.offset, OV.p[i].size};
         vkCmdCopyBuffer(ex->cb, OV.p[i].src, OV.p[i].sp.buffer, 1, &cp);
         ex->recorded++;

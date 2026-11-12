@@ -66,7 +66,11 @@ bool amiibo_check_font_rebuild(void);  // ui/amiibo_page.cpp; check and clear fo
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wc23-extensions"   // #embed in C++
 static const unsigned char roboto_ttf[] = {
+#if defined(__clang__) && __clang_major__ < 19
+#include "Roboto-Medium.inc"
+#else
 #embed "fonts/Roboto-Medium.ttf"
+#endif
 };
 #pragma clang diagnostic pop
 

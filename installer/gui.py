@@ -3,11 +3,11 @@
 A front end over the CLI (docs/installer.md): it collects the game files, the keys file path, the optional firmware
 folder, the game language and the install folder, runs `python -m installer ...` as a subprocess and shows its JSON
 events. Decisions live in guilogic.py; this file only draws. The window text is in
-installer/text/<en|ru|pt-BR|zh-Hans>.json under "ui.*" and "launcher.*" ids. On Windows the window follows the
+installer/text/<en|ru|pt-BR|zh-Hans|es>.json under "ui.*" and "launcher.*" ids. On Windows the window follows the
 display's DPI (installer/dpi.py): fonts and paddings grow with the scale, so Windows does not stretch it.
 
     --selftest [--shots DIR]   build every screen in every language and close by itself (PNG per screen with --shots)
-    --lang en|ru|pt-BR|zh-Hans window language (default: the Windows display language)
+    --lang en|ru|pt-BR|zh-Hans|es window language (default: the Windows display language)
     --rebuild DIR              rebuild the install folder DIR for its mods (totk.exe starts this, build-cache/rebuild.txt):
                                the run starts at once with that folder, and the game starts again when it succeeds
 """
@@ -108,11 +108,18 @@ class App:
         style.configure('Err.TLabel', foreground='#c01c28')
         style.configure('Version.TLabel', foreground='#808080')
 
-        top = ttk.Frame(root, padding=(PAD, PAD, PAD, 0))
+        top = tk.Frame(root, background='#19364B', padx=PAD, pady=PAD)
         top.pack(fill='x')
-        self.title = self.label(top, 'ui.title', style='Title.TLabel')
-        self.title.pack(side='left')
-        version = ttk.Label(top, style='Version.TLabel')
+        identity = tk.Frame(top, background='#19364B')
+        identity.pack(side='left')
+        self.title = tk.Label(identity, background='#19364B', foreground='white',
+                              font=(self.ui_font, 15, 'bold'))
+        self.bind_text(self.title, 'text', 'ui.title')
+        self.title.pack(anchor='w')
+        self.fork_label = tk.Label(identity, text='Aidem12 Fork - Steam Deck Edition',
+                                   background='#19364B', foreground='white', font=(self.ui_font, 10))
+        self.fork_label.pack(anchor='w')
+        version = tk.Label(top, background='#19364B', foreground='#D6E3EC')
         self.bind_text(version, 'text', 'ui.version', version=layout.release)
         version.pack(side='left', padx=(dpi.px(10), 0), pady=(dpi.px(6), 0))
         sw = ttk.Frame(top)

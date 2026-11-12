@@ -507,8 +507,10 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
         w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)i,
                                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                       .pBufferInfo = &dbi[i]};
-    VkBufferImageCopy *copies = calloc((size_t)n, sizeof *copies);
-    VkBufferCopy *bcp = calloc((size_t)n, sizeof *bcp);
+    VkBufferImageCopy copies_local[16] = {0};
+    VkBufferCopy bcp_local[16] = {0};
+    VkBufferImageCopy *copies = n > 0 && n <= 16 ? copies_local : calloc((size_t)n, sizeof *copies);
+    VkBufferCopy *bcp = n > 0 && n <= 16 ? bcp_local : calloc((size_t)n, sizeof *bcp);
     if (!copies || !bcp) rt_fatal("vk: out of memory (ASTC regions)");
     VkDeviceSize rb_off = 0;
     int chunks = 0;
@@ -604,7 +606,8 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
         vk_astc_time_summary();
     }
     n_dispatch += (uint64_t)n;
-    free(copies), free(bcp);
+    if (copies != copies_local) free(copies);
+    if (bcp != bcp_local) free(bcp);
     vk_defer_buffer(sb, sa);
     return 1;
 }

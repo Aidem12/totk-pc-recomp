@@ -75,13 +75,18 @@ static ZSTD_DDict *dict_for(uint64_t guest, uint64_t content, uint64_t size) {
     if (!content || !size || size > MAX_DICT || content >= RT_ADDRESS_LIMIT || content + size > RT_ADDRESS_LIMIT)
         return NULL;
     uint64_t print = fingerprint(gp(content), size);
+    // Host dictionaries never expire. Recompute the original fingerprint before a thread-local hit;
+    // no mutable guest data or relaxed key checks are cached.
+    static _Thread_local Dict last;
+    if (last.dd && last.guest == guest && last.content == content && last.size == size && last.print == print)
+        return last.dd;
     ZSTD_DDict *dd = NULL;
     plat_mutex_lock_shared(&dict_lock);
     for (int i = 0; i < ndicts && !dd; i++)
         if (dicts[i].guest == guest && dicts[i].content == content && dicts[i].size == size && dicts[i].print == print)
             dd = dicts[i].dd;
     plat_mutex_unlock_shared(&dict_lock);
-    if (dd) return dd;
+    if (dd) { last = (Dict){guest, content, size, print, dd}; return dd; }
     // A copy: the guest may free or reuse its buffer. Entries are never freed (another thread may be decoding with
     // one); a full table sends further dictionaries to the guest decoder.
     ZSTD_DDict *made = ZSTD_createDDict(gp(content), (size_t)size);
@@ -96,8 +101,10 @@ static ZSTD_DDict *dict_for(uint64_t guest, uint64_t content, uint64_t size) {
     if (dd != made) {
         ZSTD_freeDDict(made);
         if (!dd) rt_log("zstd: more than %d dictionaries: further ones decode in the guest", NDICT);
+        if (dd) last = (Dict){guest, content, size, print, dd};
         return dd;
     }
+    last = (Dict){guest, content, size, print, dd};
     rt_log("zstd: host dictionary %d for %s %#llx: %llu bytes at %#llx, id %u", slot, guest ? "DDict" : "raw dict",
            (unsigned long long)(guest ? guest : content), (unsigned long long)size, (unsigned long long)content,
            ZSTD_getDictID_fromDDict(dd));

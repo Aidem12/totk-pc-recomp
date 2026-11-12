@@ -77,6 +77,7 @@ typedef struct PoolRec {
 } PoolRec;
 
 static void mirror_forget(PoolRec *r);   // pool_lock exclusive: off the mirrored list
+static int dirty_census;                 // optional exhaustive perf diagnosis
 static int shadow_on;                    // shadow mode: imported pools get shadow storage instead (vk_mem_class_log)
 static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size);
 static void shadow_touch(PoolRec *r);
@@ -544,7 +545,7 @@ void vk_mem_census(uint64_t frame) {
     mirror_frame = frame;
     static uint64_t window_start;
     if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame);
-    if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
+    if (dirty_census && (rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800)
         mirror_log(frame), shadow_log(frame);   // mirror_log also logs the write-watch line
     if (frame == 1200) {   // loading is over: the first window starts here
@@ -1285,7 +1286,7 @@ static void shadow_log(uint64_t frame) {
 }
 
 void vk_mem_dirty_submit(void) {
-    if (!(rt_trace & RT_TRACE_PERF) || vk_mirror_on) return;   // the mirror's own line replaces the census
+    if (!dirty_census || !(rt_trace & RT_TRACE_PERF) || vk_mirror_on) return;   // optional census only
     uint64_t t0 = kern_now_ns();
     uint32_t prev = dirty_sub;   // the submit whose replay noted the bindings
     dirty_sub = prev + 1 ? prev + 1 : 1;
@@ -1467,6 +1468,7 @@ static volatile int64_t m_live_n, m_live_bytes, m_refused_n[MR_N], m_refused_byt
 static volatile int64_t m_flush_calls, m_flush_bytes, v_pages, v_skipped, v_mismatch;
 
 static void mirror_mode(int discrete) {
+    dirty_census = rt_knob("DIRTY_CENSUS", "0");
     const char *e = cfg_value("TOTK_MEMORY");
     int mode = discrete ? 1 : 0;   // 0 import, 1 mirror, 2 verify
     const char *why = discrete ? "auto, discrete gpu" : "auto, uma";
