@@ -1139,26 +1139,38 @@ static void shadow_sync_pool(PoolRec *r) {
     shadow_copy_newer(r, since);
 }
 
+// The pending list cannot change under shadow_lock. Skip its pool-disjoint prefix for every dirty run;
+// compute it only if a run actually needs copying. The recursive subtraction and deferred-copy order stay intact.
+static void shadow_copy_run(PoolRec *r, uint64_t lo, uint64_t hi, int *first) {
+    if (*first < 0) {
+        int i = 0;
+        while (i < nspend && !(spend[i].lo < r->import_hi && spend[i].hi > r->import_lo)) i++;
+        *first = i;
+    }
+    shadow_copy(r, lo, hi, *first);
+}
+
 // shadow_lock and gen_lock held: copies the pool's pages stamped after since into its shadow, in runs.
 static void shadow_copy_newer(PoolRec *r, uint32_t since) {
     uint64_t lo = r->import_lo, hi = r->import_hi;
     uint64_t run = 0;
+    int first = nspend ? -1 : 0;
     for (uint64_t k = lo >> REG_SHIFT; k <= (hi - 1) >> REG_SHIFT; k++) {
         uint64_t a = k << REG_SHIFT, b = a + (1ull << REG_SHIFT);
         if (a < lo) a = lo;
         if (b > hi) b = hi;
         const uint32_t *ch = gen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
         if (reg_max[k] <= since || !ch) {
-            if (run) shadow_copy(r, run, a, 0), run = 0;
+            if (run) shadow_copy_run(r, run, a, &first), run = 0;
             continue;
         }
         for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT) {
             int dirty = ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since;
             if (dirty && !run) run = x;
-            else if (!dirty && run) shadow_copy(r, run, x, 0), run = 0;
+            else if (!dirty && run) shadow_copy_run(r, run, x, &first), run = 0;
         }
     }
-    if (run) shadow_copy(r, run, hi, 0);
+    if (run) shadow_copy_run(r, run, hi, &first);
 }
 
 // TOTK_SYNC_AHEAD (nvn_api_core.c): the game may have been told a value is done (at most the guard) that the GPU still

@@ -710,7 +710,9 @@ void rc_vkCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) {
     for (uint32_t i = 0; i < ri->colorAttachmentCount; i++) chained |= ri->pColorAttachments[i].pNext != NULL;
     if (chained) { FALLBACK(); vkCmdBeginRendering(cb, ri); return; }
     size_t c = sizeof *ri->pColorAttachments * ri->colorAttachmentCount, one = sizeof(VkRenderingAttachmentInfo);
-    VkRenderingInfo *a = put(R_BeginRendering, sizeof *a + A8(c) + 2 * A8(one));
+    // Absent attachments carry no payload; preserve the independent depth/stencil copies when present.
+    size_t ds = (ri->pDepthAttachment != NULL) + (ri->pStencilAttachment != NULL);
+    VkRenderingInfo *a = put(R_BeginRendering, sizeof *a + A8(c) + ds * A8(one));
     uint8_t *at = (uint8_t *)(a + 1);
     *a = *ri;
     a->pColorAttachments = tail_copy(&at, ri->pColorAttachments, c);

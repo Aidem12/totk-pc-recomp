@@ -42,6 +42,7 @@
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
+#include "sha256.h"
 #include "platform/platform.h"
 
 #define CONTROL_SIZE 0x880
@@ -1063,20 +1064,19 @@ static size_t pack_answers(uint8_t *o, const GfxShaderAnswers *a) {
     return (size_t)(p - o);
 }
 
-static int build_code_hash(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
-                           const uint8_t *c1, uint32_t c1_len, uint8_t hash[32]) {
-    size_t total = 4 + CONTROL_SIZE + 8 + (size_t)code_size + 4 + c1_len;
-    uint8_t *buf = malloc(total), *p = buf;
-    if (!buf) return 0;
-    put_u32(&p, (uint32_t)stage);
-    memcpy(p, control, CONTROL_SIZE), p += CONTROL_SIZE;
-    memcpy(p, &code_size, 8), p += 8;
-    memcpy(p, code, (size_t)code_size), p += code_size;
-    put_u32(&p, c1_len);
-    if (c1_len) memcpy(p, c1, c1_len);
-    rt_sha256(buf, total, hash);
-    free(buf);
-    return 1;
+// Hash the same byte sequence without assembling a second copy of the program and constants.
+static void build_code_hash(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
+                            const uint8_t *c1, uint32_t c1_len, uint8_t hash[32]) {
+    Sha256 state;
+    uint32_t st = (uint32_t)stage;
+    sha256_init(&state);
+    sha256_update(&state, &st, sizeof st);
+    sha256_update(&state, control, CONTROL_SIZE);
+    sha256_update(&state, &code_size, sizeof code_size);
+    if (code_size) sha256_update(&state, code, (size_t)code_size);
+    sha256_update(&state, &c1_len, sizeof c1_len);
+    if (c1_len) sha256_update(&state, c1, c1_len);
+    sha256_final(&state, hash);
 }
 
 // The answers with everything outside the mask zeroed; the translator ignores depth_minus_w (Program.cs).
@@ -1248,8 +1248,7 @@ static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *co
     if (!code || r->length > code_size || c1_off > r->length || skip >= r->length) return fail("bad control section", NULL), 0;
     r->c1_len = r->length - c1_off;
     r->c1 = c1 ? c1 : code + c1_off;
-    if (!build_code_hash(stage, control, code, r->length, r->c1, r->c1_len, r->code_hash))
-        return fail("out of memory", NULL), 0;
+    build_code_hash(stage, control, code, r->length, r->c1, r->c1_len, r->code_hash);
     paths();
     UseMask m;
     r->final = use_find(r->code_hash, &m);

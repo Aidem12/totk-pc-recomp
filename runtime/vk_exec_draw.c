@@ -2112,12 +2112,10 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
     }
     uint32_t n_sets = info->n_sets ? info->n_sets : 1;
     uint32_t lo[2] = {0, 0}, hi[2] = {0, 0}, d0[2] = {0, 0};   // bindings [lo, hi) and first descriptor per set
-    int need_w = 0;                                             // a set without a template: fill the write structs
     for (uint32_t s = 0, i0 = 0; s < n_sets; s++) {
         uint32_t i1 = i0;
         while (i1 < info->n_bindings && (n_sets == 1 || info->bindings[i1].set == s)) i1++;
         lo[s] = i0, hi[s] = i1, i0 = i1;
-        if (i1 > lo[s] && !info->tpl[s]) need_w = 1;
     }
     uint32_t nd = 0;
     for (uint32_t i = 0; i < info->n_bindings; i++) {
@@ -2126,6 +2124,9 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         uint32_t cnt = b->count ? b->count : 1;
         if (nd + cnt > MAX_DESC) rt_fatal("vk: %u descriptors exceed the replay's %d", nd + cnt, MAX_DESC);
         if (n_sets == 2 && i == lo[1]) d0[1] = nd;
+        // Only the set without an update template consumes write structs (including push fallback).
+        uint32_t set = n_sets == 2 && i >= lo[1] ? 1 : 0;
+        int need_w = !info->tpl[set];
         VkDescSlot *o = &d[nd];
         int st = nvn_stage_of(b->stage), kind = 0;   // kind: 0 buffer, 1 image, 2 texel buffer view
         if (b->kind == VK_PIPE_SUPPORT) {

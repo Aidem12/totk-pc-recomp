@@ -910,11 +910,13 @@ static void upload_cpu(Tex *e) {
     int astc = e->f.astc_bw != 0, rgb = e->f.expand_rgb;
     int agpu = astc && vk_astc_gpu(), acheck = agpu && vk_astc_mode() == VK_ASTC_CHECK;   // raw blocks to the GPU
     uint32_t n = levels * layers, k = 0;
-    VkBufferImageCopy rg_local[16] = {0};
-    VkAstcRegion ar_local[16] = {0};
+    VkBufferImageCopy rg_local[16];
+    VkAstcRegion ar_local[16];
     VkBufferImageCopy *rg = n <= 16 ? rg_local : calloc(n, sizeof *rg);
     VkAstcRegion *ar = agpu ? (n <= 16 ? ar_local : calloc(n, sizeof *ar)) : NULL;
     if (!rg || (agpu && !ar)) rt_fatal("vk: out of memory (upload regions)");
+    if (rg == rg_local) memset(rg, 0, (size_t)n * sizeof *rg);
+    if (ar == ar_local) memset(ar, 0, (size_t)n * sizeof *ar);
     VkDeviceSize total = 0, decoded = 0;
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {

@@ -11,6 +11,7 @@
 // Side effects written after GPU completion, as MacNativeGames does: games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c:7-9
 // (https://github.com/ly05010419/MacNativeGames @ b75be8cfa704df3701e86130c8ced268e79d6b11, MIT, Copyright (c) 2026
 // jhaizhou; origin d2r-mobile).
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -33,7 +34,7 @@ static PlatThread *completion_thread;
 static PlatMutex sub_lock = PLAT_MUTEX_INIT;
 static VkCommandPool cmd_pool;
 static CmdSlot *slots;
-static int nslots;
+static int nslots, cap_slots;
 static int cur_slot;          // the slot vk_sync_submit records into now (an index: take_slot may move slots)
 static uint64_t cur_fence;    // the value of the submission being recorded
 
@@ -345,9 +346,15 @@ static int claim_slot(VkCtx *c, uint64_t fence) {
             return i;
         }
     rec_drain();   // the part pool is the recorder's while it has packets (vk_rec.h): it is idle for the allocation
-    CmdSlot *n = realloc(slots, sizeof *n * (size_t)(nslots + 1));
-    if (!n) rt_fatal("vk: out of memory (command buffers)");
-    slots = n;
+    if (nslots == cap_slots) {
+        if (cap_slots == INT_MAX) rt_fatal("vk: too many command buffers");
+        int cap = !cap_slots ? 8 : cap_slots > INT_MAX / 2 ? INT_MAX : cap_slots * 2;
+        if ((size_t)cap > SIZE_MAX / sizeof *slots) rt_fatal("vk: command buffer table overflow");
+        CmdSlot *n = realloc(slots, sizeof *n * (size_t)cap);
+        if (!n) rt_fatal("vk: out of memory (command buffers)");
+        slots = n;
+        cap_slots = cap;
+    }
     CmdSlot *s = &slots[nslots];
     VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cmd_pool,
                                       .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
@@ -611,7 +618,7 @@ void vk_sync_shutdown(void) {
         cmd_pool = VK_NULL_HANDLE;
         free(slots);
         slots = NULL;
-        nslots = 0;
+        nslots = cap_slots = 0;
         plat_mutex_unlock(&sub_lock);
         __atomic_store_n(&started, 0, __ATOMIC_RELEASE);
     }
